@@ -1,8 +1,10 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/exec_flow.rs
+assertion_line: 1068
 expression: combined
 ---
-↳ Interacted with background terminal · cargo test -p codex-core
-  └ (waited)
+• Waited for background terminal · cargo test -p codex-core
 
 • Final response.
+
+  Worked for [duration] • [completion time]

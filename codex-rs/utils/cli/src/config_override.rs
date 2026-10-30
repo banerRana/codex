@@ -37,6 +37,13 @@ pub struct CliConfigOverrides {
 }
 
 impl CliConfigOverrides {
+    /// Prepend root-level config flags so they have lower precedence than
+    /// command-specific flags parsed after a subcommand.
+    pub fn prepend_root_overrides(&mut self, root_overrides: Self) {
+        self.raw_overrides
+            .splice(0..0, root_overrides.raw_overrides);
+    }
+
     /// Parse the raw strings captured from the CLI into a list of `(path,
     /// value)` tuples where `value` is a `serde_json::Value`.
     pub fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String> {
@@ -75,68 +82,13 @@ impl CliConfigOverrides {
             })
             .collect()
     }
-
-    /// Apply all parsed overrides onto `target`. Intermediate objects will be
-    /// created as necessary. Values located at the destination path will be
-    /// replaced.
-    pub fn apply_on_value(&self, target: &mut Value) -> Result<(), String> {
-        let overrides = self.parse_overrides()?;
-        for (path, value) in overrides {
-            apply_single_override(target, &path, value);
-        }
-        Ok(())
-    }
 }
 
 fn canonicalize_override_key(key: &str) -> String {
-    if key == "use_linux_sandbox_bwrap" {
-        "features.use_linux_sandbox_bwrap".to_string()
+    if key == "use_legacy_landlock" {
+        "features.use_legacy_landlock".to_string()
     } else {
         key.to_string()
-    }
-}
-
-/// Apply a single override onto `root`, creating intermediate objects as
-/// necessary.
-fn apply_single_override(root: &mut Value, path: &str, value: Value) {
-    use toml::value::Table;
-
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut current = root;
-
-    for (i, part) in parts.iter().enumerate() {
-        let is_last = i == parts.len() - 1;
-
-        if is_last {
-            match current {
-                Value::Table(tbl) => {
-                    tbl.insert((*part).to_string(), value);
-                }
-                _ => {
-                    let mut tbl = Table::new();
-                    tbl.insert((*part).to_string(), value);
-                    *current = Value::Table(tbl);
-                }
-            }
-            return;
-        }
-
-        // Traverse or create intermediate table.
-        match current {
-            Value::Table(tbl) => {
-                current = tbl
-                    .entry((*part).to_string())
-                    .or_insert_with(|| Value::Table(Table::new()));
-            }
-            _ => {
-                *current = Value::Table(Table::new());
-                if let Value::Table(tbl) = current {
-                    current = tbl
-                        .entry((*part).to_string())
-                        .or_insert_with(|| Value::Table(Table::new()));
-                }
-            }
-        }
     }
 }
 
@@ -147,6 +99,39 @@ fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
         .get("_x_")
         .cloned()
         .ok_or_else(|| SerdeError::custom("missing sentinel key"))
+}
+
+/// Collects config overrides across command boundaries in argument order.
+///
+/// Clap keeps the deepest global argument's values instead of appending across
+/// scopes. Reparse with local config arguments after validating the typed CLI.
+pub fn collect_config_overrides(
+    command: clap::Command,
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
+) -> Result<CliConfigOverrides, clap::Error> {
+    let matches = localize_config_arg(command).try_get_matches_from(args)?;
+    let raw_overrides = std::iter::successors(Some(&matches), |scope| {
+        scope.subcommand().map(|(_, child)| child)
+    })
+    .filter_map(|scope| scope.get_many::<String>("raw_overrides"))
+    .flatten()
+    .cloned()
+    .collect();
+    Ok(CliConfigOverrides { raw_overrides })
+}
+
+fn localize_config_arg(mut command: clap::Command) -> clap::Command {
+    use clap::CommandFactory;
+
+    if !command
+        .get_arguments()
+        .any(|arg| arg.get_id() == "raw_overrides")
+    {
+        command = command.args(CliConfigOverrides::command().get_arguments().cloned());
+    }
+    command
+        .mut_arg("raw_overrides", |arg| arg.global(false))
+        .mut_subcommands(localize_config_arg)
 }
 
 #[cfg(test)]
@@ -181,13 +166,31 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_use_linux_sandbox_bwrap_alias() {
+    fn canonicalizes_use_legacy_landlock_alias() {
         let overrides = CliConfigOverrides {
-            raw_overrides: vec!["use_linux_sandbox_bwrap=true".to_string()],
+            raw_overrides: vec!["use_legacy_landlock=true".to_string()],
         };
         let parsed = overrides.parse_overrides().expect("parse_overrides");
-        assert_eq!(parsed[0].0.as_str(), "features.use_linux_sandbox_bwrap");
+        assert_eq!(parsed[0].0.as_str(), "features.use_legacy_landlock");
         assert_eq!(parsed[0].1.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn prepends_root_overrides() {
+        let mut subcommand_overrides = CliConfigOverrides {
+            raw_overrides: vec![r#"model="gpt-5.2""#.to_string()],
+        };
+        subcommand_overrides.prepend_root_overrides(CliConfigOverrides {
+            raw_overrides: vec![r#"model="gpt-5.1""#.to_string()],
+        });
+
+        assert_eq!(
+            subcommand_overrides.raw_overrides,
+            vec![
+                r#"model="gpt-5.1""#.to_string(),
+                r#"model="gpt-5.2""#.to_string(),
+            ]
+        );
     }
 
     #[test]

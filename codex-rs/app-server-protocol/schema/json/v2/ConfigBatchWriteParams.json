@@ -45,6 +45,10 @@
         "string",
         "null"
       ]
+    },
+    "reloadUserConfig": {
+      "description": "When true, hot-reload updated runtime settings into loaded threads after writing. Session-static model, reasoning-effort, Plan-mode reasoning-effort, and service-tier defaults are not reloaded. The deprecated personality setting is also not reloaded.",
+      "type": "boolean"
     }
   },
   "required": [

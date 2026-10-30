@@ -129,8 +129,8 @@ const codex = new Codex({
 });
 ```
 
-The SDK still injects its required variables (such as `OPENAI_BASE_URL` and `CODEX_API_KEY`) on top of the environment you
-provide.
+The SDK still injects its required variables (such as `CODEX_API_KEY`) on top of the environment you provide. If you set
+`baseUrl`, the SDK passes it as a `--config openai_base_url=...` override.
 
 ### Passing `--config` overrides
 
@@ -146,4 +146,15 @@ const codex = new Codex({
 });
 ```
 
-Thread options still take precedence for overlapping settings because they are emitted after these global overrides.
+For configuration keys that cannot be expressed as dotted paths, pass raw TOML overrides with `configOverrides`. Each entry
+is forwarded unchanged as a separate `--config` argument, without modifying `CODEX_HOME`:
+
+```typescript
+const codex = new Codex({
+  config: { default_permissions: "audit" },
+  configOverrides: ['permissions.audit.filesystem={":root"="read","/path/to/project/.env"="deny"}'],
+});
+```
+
+Raw overrides are applied after structured `config` overrides and take precedence over them. SDK-managed settings, such as
+`baseUrl`, and thread-specific options are applied afterward and take precedence.

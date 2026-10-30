@@ -1,110 +1,137 @@
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use crate::client::ModelClient;
-use crate::client::ModelClientSession;
-use crate::codex::TurnContext;
-use crate::codex::run_turn;
-use crate::state::TaskKind;
-use async_trait::async_trait;
-use codex_otel::OtelManager;
-use codex_protocol::openai_models::ModelInfo;
-use codex_protocol::user_input::UserInput;
-use tokio::task::JoinHandle;
+use codex_async_utils::OrCancelExt;
+use codex_extension_api::TurnStartPhase;
 use tokio_util::sync::CancellationToken;
+
+use crate::session::TurnInput;
+use crate::session::session::Session;
+use crate::session::startup_prewarm::SessionStartupPrewarmResolution;
+use crate::session::turn::McpStartupRequirements;
+use crate::session::turn::run_hooks_and_record_inputs;
+use crate::session::turn::run_turn;
+use crate::session::turn_context::TurnContext;
+use crate::state::TaskKind;
+use codex_thread_store::PersistContext;
 use tracing::Instrument;
 use tracing::trace_span;
-use tracing::warn;
 
 use super::SessionTask;
-use super::SessionTaskContext;
+use super::SessionTaskResult;
 
-type PrewarmedSessionTask = JoinHandle<Option<ModelClientSession>>;
-
-pub(crate) struct RegularTask {
-    prewarmed_session_task: Mutex<Option<PrewarmedSessionTask>>,
-}
-
-impl Default for RegularTask {
-    fn default() -> Self {
-        Self {
-            prewarmed_session_task: Mutex::new(None),
-        }
-    }
-}
+#[derive(Default)]
+pub(crate) struct RegularTask;
 
 impl RegularTask {
-    pub(crate) fn with_startup_prewarm(
-        model_client: ModelClient,
-        otel_manager: OtelManager,
-        model_info: ModelInfo,
-    ) -> Self {
-        let prewarmed_session_task = tokio::spawn(async move {
-            let mut client_session = model_client.new_session();
-            match client_session
-                .prewarm_websocket(&otel_manager, &model_info)
-                .await
-            {
-                Ok(()) => Some(client_session),
-                Err(err) => {
-                    warn!("startup websocket prewarm task failed: {err}");
-                    None
-                }
-            }
-        });
-
-        Self {
-            prewarmed_session_task: Mutex::new(Some(prewarmed_session_task)),
-        }
-    }
-
-    async fn take_prewarmed_session(&self) -> Option<ModelClientSession> {
-        let prewarmed_session_task = self
-            .prewarmed_session_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        match prewarmed_session_task {
-            Some(task) => match task.await {
-                Ok(client_session) => client_session,
-                Err(err) => {
-                    warn!("startup websocket prewarm task join failed: {err}");
-                    None
-                }
-            },
-            None => None,
-        }
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
-#[async_trait]
 impl SessionTask for RegularTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
     }
 
+    fn span_name(&self) -> &'static str {
+        "session_task.turn"
+    }
+
     async fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        sess: Arc<Session>,
         ctx: Arc<TurnContext>,
-        input: Vec<UserInput>,
+        input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
-    ) -> Option<String> {
-        let sess = session.clone_session();
-        let run_turn_span = trace_span!("run_turn");
-        sess.set_server_reasoning_included(false).await;
-        sess.services
-            .otel_manager
-            .apply_traceparent_parent(&run_turn_span);
-        let prewarmed_client_session = self.take_prewarmed_session().await;
-        run_turn(
-            sess,
-            ctx,
-            input,
-            prewarmed_client_session,
-            cancellation_token,
-        )
-        .instrument(run_turn_span)
-        .await
+    ) -> SessionTaskResult {
+        if ctx
+            .config
+            .features
+            .enabled(codex_features::Feature::CriticalPathTiming)
+            && !ctx.session_source.is_non_root_agent()
+        {
+            ctx.turn_timing_state.enable_critical_path();
+        }
+        let run_turn_span = trace_span!(
+            "run_turn",
+            conversation.id = %sess.thread_id,
+            turn.id = %ctx.sub_id,
+        );
+        // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
+        // not wait on startup prewarm resolution.
+        let prewarmed_client_session = async {
+            sess.emit_turn_started(&ctx, TaskKind::Regular).await;
+            // Regular-start contributors run once, after the task is visible and interruptible.
+            let prepares_mcp = sess
+                .services
+                .extensions
+                .turn_lifecycle_contributors()
+                .iter()
+                .any(|contributor| {
+                    contributor.turn_start_phase(&sess.services.thread_extension_data)
+                        == TurnStartPhase::RegularTaskStart
+                        && contributor.requires_mcp_runtime(&sess.services.thread_extension_data)
+                });
+            let preparation = sess
+                .emit_turn_start_lifecycle(
+                    &ctx,
+                    /*token_usage_at_turn_start*/ None,
+                    TurnStartPhase::RegularTaskStart,
+                )
+                .or_cancel(&cancellation_token)
+                .await;
+            // Even cancelled discovery may have cleared the previous account's catalog.
+            if prepares_mcp {
+                sess.request_mcp_runtime_reprojection();
+            }
+            if preparation.is_err() {
+                return SessionStartupPrewarmResolution::Cancelled;
+            }
+            sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
+                .await
+        }
+        .instrument(trace_span!("regular_task.prepare_run_turn"))
+        .await;
+        let prewarmed_client_session = match prewarmed_client_session {
+            SessionStartupPrewarmResolution::Cancelled => {
+                let _ = run_hooks_and_record_inputs(
+                    &sess,
+                    &ctx,
+                    &ctx.capture_current_model_info(),
+                    &input,
+                    PersistContext::Standard,
+                )
+                .await;
+                return Ok(None);
+            }
+            SessionStartupPrewarmResolution::Unavailable { .. } => None,
+            SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
+                Some(*prewarmed_client_session)
+            }
+        };
+        let mut next_input = input;
+        let mut prewarmed_client_session = prewarmed_client_session;
+        let mut mcp_startup_requirements = McpStartupRequirements::default();
+        loop {
+            let last_agent_message = run_turn(
+                Arc::clone(&sess),
+                Arc::clone(&ctx),
+                next_input,
+                &mut mcp_startup_requirements,
+                prewarmed_client_session.take(),
+                cancellation_token.child_token(),
+            )
+            .instrument(run_turn_span.clone())
+            .await?;
+            // Terminal errors are already reported. Let task completion preserve pending
+            // input instead of restarting the failed turn for that same input.
+            if ctx.terminal_error.lock().await.is_some() {
+                return Ok(last_agent_message);
+            }
+            if !sess.input_queue.has_pending_input(&sess.active_turn).await {
+                return Ok(last_agent_message);
+            }
+            next_input = Vec::new();
+        }
     }
 }

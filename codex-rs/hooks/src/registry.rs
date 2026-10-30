@@ -1,47 +1,221 @@
-use tokio::process::Command;
-
+use crate::engine::ClaudeHooksEngine;
+use crate::engine::CommandShell;
+use crate::engine::ConfiguredHandler;
+use crate::engine::HookListEntry;
+use crate::engine::command_runner::CommandHookRuntime;
+use crate::events::compact::PostCompactRequest;
+use crate::events::compact::PreCompactOutcome;
+use crate::events::compact::PreCompactRequest;
+use crate::events::compact::StatelessHookOutcome;
+use crate::events::interrupt::InterruptOutcome;
+use crate::events::interrupt::InterruptRequest;
+use crate::events::permission_request::PermissionRequestOutcome;
+use crate::events::permission_request::PermissionRequestRequest;
+use crate::events::post_tool_use::PostToolUseOutcome;
+use crate::events::post_tool_use::PostToolUseRequest;
+use crate::events::pre_tool_use::PreToolUseOutcome;
+use crate::events::pre_tool_use::PreToolUseRequest;
+use crate::events::session_end::SessionEndOutcome;
+use crate::events::session_end::SessionEndRequest;
+use crate::events::session_start::SessionStartOutcome;
+use crate::events::session_start::SessionStartRequest;
+use crate::events::stop::StopOutcome;
+use crate::events::stop::StopRequest;
+use crate::events::user_prompt_submit::UserPromptSubmitOutcome;
+use crate::events::user_prompt_submit::UserPromptSubmitRequest;
+use crate::mcp::HookMcpExecutor;
 use crate::types::Hook;
 use crate::types::HookEvent;
 use crate::types::HookPayload;
 use crate::types::HookResponse;
+use async_channel::Receiver;
+use codex_config::ConfigLayerStack;
+use codex_plugin::ExecutorPluginHookSource;
+use codex_plugin::PluginHookSource;
+use codex_protocol::ThreadId;
+use codex_protocol::protocol::HookEventName;
+use codex_protocol::protocol::HookExecutionMode;
+use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
+use std::ffi::OsString;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::process::Command;
 
 #[derive(Default, Clone)]
 pub struct HooksConfig {
     pub legacy_notify_argv: Option<Vec<String>>,
+    pub feature_enabled: bool,
+    pub bypass_hook_trust: bool,
+    pub config_layer_stack: Option<ConfigLayerStack>,
+    pub plugin_hook_sources: Vec<PluginHookSource>,
+    pub plugin_hook_load_warnings: Vec<String>,
+    pub shell_program: Option<String>,
+    pub shell_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookListOutcome {
+    pub hooks: Vec<HookListEntry>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone)]
 pub struct Hooks {
-    after_agent: Vec<Hook>,
-    after_tool_use: Vec<Hook>,
+    // TODO: Once legacy `notify` is removed, capture this snapshot in `CommandHookRuntime::new`
+    // and remove the environment plumbing from `Hooks` and `from_config`.
+    environment: Arc<Vec<(OsString, OsString)>>,
+    after_agent: Arc<[Hook]>,
+    engine: ClaudeHooksEngine,
+    plugin_hook_sources: Arc<[PluginHookSource]>,
+    plugin_hook_load_warnings: Arc<[String]>,
 }
 
-impl Default for Hooks {
-    fn default() -> Self {
-        Self::new(HooksConfig::default())
-    }
-}
-
-// Hooks are arbitrary, user-specified functions that are deterministically
-// executed after specific events in the Codex lifecycle.
 impl Hooks {
-    pub fn new(config: HooksConfig) -> Self {
+    /// Bind this session's hook runtime and output files to its thread, rejecting unloadable
+    /// required managed hooks.
+    pub fn new(
+        config: HooksConfig,
+        thread_id: ThreadId,
+        mcp_executor: Arc<dyn HookMcpExecutor>,
+    ) -> anyhow::Result<(Self, Receiver<codex_protocol::protocol::HookCompletedEvent>)> {
+        let (result_sender, result_receiver) = async_channel::unbounded();
+        let environment = Arc::new(std::env::vars_os().collect());
+        let hooks = Self::from_config(config, mcp_executor, Arc::clone(&environment), |shell| {
+            CommandHookRuntime::new(shell, environment, thread_id, result_sender)
+        });
+        crate::engine::discovery::ensure_required_hooks_loaded(
+            hooks.engine.required_load_errors(),
+        )?;
+        Ok((hooks, result_receiver))
+    }
+
+    /// Preserve in-flight background hooks while applying a refreshed configuration.
+    pub fn reconfigured(&self, config: HooksConfig) -> Self {
+        Self::from_config(
+            config,
+            Arc::clone(&self.engine.mcp_executor),
+            Arc::clone(&self.environment),
+            |shell| self.engine.command_runtime.reconfigured(shell),
+        )
+    }
+
+    pub fn matches_plugin_hooks<'a>(
+        &self,
+        sources: impl IntoIterator<Item = &'a PluginHookSource>,
+        warnings: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        self.plugin_hook_sources.iter().eq(sources)
+            && self.plugin_hook_load_warnings.iter().eq(warnings)
+    }
+
+    /// Adds only owner-admitted requirements hooks; execution remains scoped to their environment.
+    pub fn with_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+        executor: Arc<dyn crate::HookEnvironmentExecutor>,
+    ) -> Self {
+        let discovered = self.discover_environment_hooks(sources);
+        let mut hooks = self.clone();
+        hooks.engine.command_runtime.environment_executor = Some(executor);
+        if !discovered.handlers.is_empty() {
+            Arc::make_mut(&mut hooks.engine.handlers).extend(discovered.handlers);
+        }
+        if !discovered.warnings.is_empty() {
+            let mut warnings = hooks.engine.warnings.to_vec();
+            warnings.extend(discovered.warnings);
+            hooks.engine.warnings = warnings.into();
+        }
+        hooks
+    }
+
+    /// List this session's declarations, including hooks that are disabled or not yet trusted.
+    pub fn list_with_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+    ) -> HookListOutcome {
+        let discovered = self.discover_environment_hooks(sources);
+        let mut hooks = self.engine.hook_entries.as_ref().clone();
+        hooks.extend(discovered.hook_entries);
+        let mut warnings = self.engine.warnings.to_vec();
+        warnings.extend(discovered.warnings);
+        HookListOutcome { hooks, warnings }
+    }
+
+    fn discover_environment_hooks(
+        &self,
+        sources: Vec<crate::EnvironmentHookSource>,
+    ) -> crate::engine::discovery::DiscoveryResult {
+        if !self.engine.enabled {
+            return crate::engine::discovery::DiscoveryResult::default();
+        }
+        let display_order = self
+            .engine
+            .hook_entries
+            .last()
+            .map_or(0, |entry| entry.display_order.saturating_add(1));
+        crate::engine::discovery::discover_environment_hooks(sources, display_order)
+    }
+
+    pub fn with_executor_hooks(&self, executor_hooks: Vec<ExecutorPluginHookSource>) -> Self {
+        let mut hooks = self.clone();
+        hooks.engine.set_executor_hooks(executor_hooks);
+        hooks
+    }
+
+    pub fn for_memory_consolidation(&self, executor_hooks: Vec<ExecutorPluginHookSource>) -> Self {
+        let mut hooks = self.with_executor_hooks(executor_hooks);
+        Arc::make_mut(&mut hooks.engine.handlers)
+            .retain(ConfiguredHandler::runs_for_memory_consolidation);
+        hooks
+    }
+
+    fn from_config(
+        config: HooksConfig,
+        mcp_executor: Arc<dyn HookMcpExecutor>,
+        environment: Arc<Vec<(OsString, OsString)>>,
+        build_runtime: impl FnOnce(CommandShell) -> CommandHookRuntime,
+    ) -> Self {
         let after_agent = config
             .legacy_notify_argv
             .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
-            .map(crate::notify_hook)
+            .map(|argv| crate::legacy_notify::notify_hook(argv, Arc::clone(&environment)))
             .into_iter()
             .collect();
+        let command_runtime = build_runtime(CommandShell {
+            program: config.shell_program.unwrap_or_default(),
+            args: config.shell_args,
+        });
+        let engine = ClaudeHooksEngine::new(
+            config.feature_enabled,
+            config.bypass_hook_trust,
+            config.config_layer_stack.as_ref(),
+            config.plugin_hook_sources.clone(),
+            config.plugin_hook_load_warnings.clone(),
+            command_runtime,
+            mcp_executor,
+        );
         Self {
+            environment,
             after_agent,
-            after_tool_use: Vec::new(),
+            engine,
+            plugin_hook_sources: config.plugin_hook_sources.into(),
+            plugin_hook_load_warnings: config.plugin_hook_load_warnings.into(),
         }
+    }
+
+    /// Abort and join outstanding async hooks during session shutdown.
+    pub async fn shutdown(&self) {
+        self.engine.command_runtime.shutdown().await;
+    }
+
+    pub fn startup_warnings(&self) -> &[String] {
+        self.engine.warnings()
     }
 
     fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook] {
         match hook_event {
             HookEvent::AfterAgent { .. } => &self.after_agent,
-            HookEvent::AfterToolUse { .. } => &self.after_tool_use,
         }
     }
 
@@ -59,424 +233,189 @@ impl Hooks {
 
         outcomes
     }
+
+    pub fn preview_session_start(
+        &self,
+        request: &SessionStartRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_session_start(request)
+    }
+
+    pub fn preview_pre_tool_use(
+        &self,
+        request: &PreToolUseRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_pre_tool_use(request)
+    }
+
+    pub fn preview_permission_request(
+        &self,
+        request: &PermissionRequestRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_permission_request(request)
+    }
+
+    /// Maximum configured timeout among PermissionRequest hooks.
+    ///
+    /// Matching handlers run concurrently, so their aggregate timeout is bounded by this maximum.
+    pub fn max_permission_request_timeout(&self) -> Duration {
+        self.engine.max_permission_request_timeout()
+    }
+
+    pub fn preview_post_tool_use(
+        &self,
+        request: &PostToolUseRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_post_tool_use(request)
+    }
+
+    pub async fn run_session_start(
+        &self,
+        request: SessionStartRequest,
+        turn_id: Option<String>,
+    ) -> SessionStartOutcome {
+        self.engine.run_session_start(request, turn_id).await
+    }
+
+    pub async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome {
+        self.engine.run_pre_tool_use(request).await
+    }
+
+    pub async fn run_permission_request(
+        &self,
+        request: PermissionRequestRequest,
+    ) -> PermissionRequestOutcome {
+        self.engine.run_permission_request(request).await
+    }
+
+    pub async fn run_post_tool_use(&self, request: PostToolUseRequest) -> PostToolUseOutcome {
+        self.engine.run_post_tool_use(request).await
+    }
+
+    pub fn preview_pre_compact(
+        &self,
+        request: &PreCompactRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_pre_compact(request)
+    }
+
+    pub async fn run_pre_compact(&self, request: PreCompactRequest) -> PreCompactOutcome {
+        self.engine.run_pre_compact(request).await
+    }
+
+    pub fn preview_post_compact(
+        &self,
+        request: &PostCompactRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_post_compact(request)
+    }
+
+    pub async fn run_post_compact(&self, request: PostCompactRequest) -> StatelessHookOutcome {
+        self.engine.run_post_compact(request).await
+    }
+
+    pub fn preview_user_prompt_submit(
+        &self,
+        request: &UserPromptSubmitRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_user_prompt_submit(request)
+    }
+
+    pub async fn run_user_prompt_submit(
+        &self,
+        request: UserPromptSubmitRequest,
+    ) -> UserPromptSubmitOutcome {
+        self.engine.run_user_prompt_submit(request).await
+    }
+
+    pub fn preview_stop(
+        &self,
+        request: &StopRequest,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_stop(request)
+    }
+
+    pub async fn run_stop(&self, request: StopRequest) -> StopOutcome {
+        self.engine.run_stop(request).await
+    }
+
+    pub fn preview_session_end(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_session_end()
+    }
+
+    pub async fn run_session_end(&self, request: SessionEndRequest) -> SessionEndOutcome {
+        self.engine.run_session_end(request).await
+    }
+
+    pub fn preview_interrupt(&self) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        self.engine.preview_interrupt()
+    }
+
+    pub async fn run_interrupt(&self, request: InterruptRequest) -> InterruptOutcome {
+        self.engine.run_interrupt(request).await
+    }
+
+    /// None if unconfigured; Sync if any handler must finish before continuing.
+    pub fn execution_mode_for_event(&self, event: HookEventName) -> Option<HookExecutionMode> {
+        self.engine
+            .handlers
+            .iter()
+            .filter(|handler| handler.event_name == event)
+            .map(ConfiguredHandler::execution_mode)
+            .min_by_key(|mode| matches!(mode, HookExecutionMode::Async))
+    }
+
+    /// Run a hook task independently of the turn, but abort and join it at session shutdown.
+    pub fn schedule_async_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.engine.command_runtime.schedule_async_task(task);
+    }
+
+    pub fn preview_model_request(
+        &self,
+        request: &crate::ModelRequestHookInput,
+    ) -> Vec<codex_protocol::protocol::HookRunSummary> {
+        crate::events::model_request::preview(&self.engine.handlers, request)
+    }
+
+    pub async fn run_model_request(
+        &self,
+        request: crate::ModelRequestHookInput,
+    ) -> Vec<codex_protocol::protocol::HookCompletedEvent> {
+        crate::events::model_request::run(&self.engine, request).await
+    }
 }
 
-pub fn command_from_argv(argv: &[String]) -> Option<Command> {
+pub fn list_hooks(config: HooksConfig) -> HookListOutcome {
+    if !config.feature_enabled {
+        return HookListOutcome::default();
+    }
+
+    let discovered = crate::engine::discovery::discover_handlers(
+        config.config_layer_stack.as_ref(),
+        config.plugin_hook_sources,
+        config.plugin_hook_load_warnings,
+        config.bypass_hook_trust,
+        crate::engine::discovery::DiscoveryMode::Listing,
+    );
+    HookListOutcome {
+        hooks: discovered.hook_entries,
+        warnings: discovered.warnings,
+    }
+}
+
+// TODO: Remove this legacy-notify-only command builder when `notify` support is removed.
+pub(crate) fn command_from_argv(
+    argv: &[String],
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Option<Command> {
     let (program, args) = argv.split_first()?;
     if program.is_empty() {
         return None;
     }
-    let mut command = Command::new(program);
+    let mut command = Command::from(codex_utils_process::background_command(program));
     command.args(args);
+    command.env_clear();
+    command.envs(environment);
+    scrub_non_inheritable_env_vars(command.as_std_mut());
     Some(command)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::path::PathBuf;
-    use std::process::Stdio;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    use anyhow::Result;
-    use chrono::TimeZone;
-    use chrono::Utc;
-    use codex_protocol::ThreadId;
-    use pretty_assertions::assert_eq;
-    use serde_json::to_string;
-    use tempfile::tempdir;
-    use tokio::time::timeout;
-
-    use super::*;
-    use crate::types::HookEventAfterAgent;
-    use crate::types::HookEventAfterToolUse;
-    use crate::types::HookResult;
-    use crate::types::HookToolInput;
-    use crate::types::HookToolKind;
-
-    const CWD: &str = "/tmp";
-    const INPUT_MESSAGE: &str = "hello";
-
-    fn hook_payload(label: &str) -> HookPayload {
-        HookPayload {
-            session_id: ThreadId::new(),
-            cwd: PathBuf::from(CWD),
-            triggered_at: Utc
-                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
-                .single()
-                .expect("valid timestamp"),
-            hook_event: HookEvent::AfterAgent {
-                event: HookEventAfterAgent {
-                    thread_id: ThreadId::new(),
-                    turn_id: format!("turn-{label}"),
-                    input_messages: vec![INPUT_MESSAGE.to_string()],
-                    last_assistant_message: Some("hi".to_string()),
-                },
-            },
-        }
-    }
-
-    fn counting_success_hook(calls: &Arc<AtomicUsize>, name: &str) -> Hook {
-        let hook_name = name.to_string();
-        let calls = Arc::clone(calls);
-        Hook {
-            name: hook_name,
-            func: Arc::new(move |_| {
-                let calls = Arc::clone(&calls);
-                Box::pin(async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    HookResult::Success
-                })
-            }),
-        }
-    }
-
-    fn failing_continue_hook(calls: &Arc<AtomicUsize>, name: &str, message: &str) -> Hook {
-        let hook_name = name.to_string();
-        let message = message.to_string();
-        let calls = Arc::clone(calls);
-        Hook {
-            name: hook_name,
-            func: Arc::new(move |_| {
-                let calls = Arc::clone(&calls);
-                let message = message.clone();
-                Box::pin(async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    HookResult::FailedContinue(std::io::Error::other(message).into())
-                })
-            }),
-        }
-    }
-
-    fn failing_abort_hook(calls: &Arc<AtomicUsize>, name: &str, message: &str) -> Hook {
-        let hook_name = name.to_string();
-        let message = message.to_string();
-        let calls = Arc::clone(calls);
-        Hook {
-            name: hook_name,
-            func: Arc::new(move |_| {
-                let calls = Arc::clone(&calls);
-                let message = message.clone();
-                Box::pin(async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    HookResult::FailedAbort(std::io::Error::other(message).into())
-                })
-            }),
-        }
-    }
-
-    fn after_tool_use_payload(label: &str) -> HookPayload {
-        HookPayload {
-            session_id: ThreadId::new(),
-            cwd: PathBuf::from(CWD),
-            triggered_at: Utc
-                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
-                .single()
-                .expect("valid timestamp"),
-            hook_event: HookEvent::AfterToolUse {
-                event: HookEventAfterToolUse {
-                    turn_id: format!("turn-{label}"),
-                    call_id: format!("call-{label}"),
-                    tool_name: "apply_patch".to_string(),
-                    tool_kind: HookToolKind::Custom,
-                    tool_input: HookToolInput::Custom {
-                        input: "*** Begin Patch".to_string(),
-                    },
-                    executed: true,
-                    success: true,
-                    duration_ms: 1,
-                    mutating: true,
-                    sandbox: "none".to_string(),
-                    sandbox_policy: "danger-full-access".to_string(),
-                    output_preview: "ok".to_string(),
-                },
-            },
-        }
-    }
-
-    #[test]
-    fn command_from_argv_returns_none_for_empty_args() {
-        assert!(command_from_argv(&[]).is_none());
-        assert!(command_from_argv(&["".to_string()]).is_none());
-    }
-
-    #[tokio::test]
-    async fn command_from_argv_builds_command() -> Result<()> {
-        let argv = if cfg!(windows) {
-            vec![
-                "cmd".to_string(),
-                "/C".to_string(),
-                "echo hello world".to_string(),
-            ]
-        } else {
-            vec!["echo".to_string(), "hello".to_string(), "world".to_string()]
-        };
-        let mut command = command_from_argv(&argv).ok_or_else(|| anyhow::anyhow!("command"))?;
-        let output = command.stdout(Stdio::piped()).output().await?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim_end_matches(['\r', '\n']);
-        assert_eq!(trimmed, "hello world");
-        Ok(())
-    }
-
-    #[test]
-    fn hooks_new_requires_program_name() {
-        assert!(Hooks::new(HooksConfig::default()).after_agent.is_empty());
-        assert!(
-            Hooks::new(HooksConfig {
-                legacy_notify_argv: Some(vec![]),
-            })
-            .after_agent
-            .is_empty()
-        );
-        assert!(
-            Hooks::new(HooksConfig {
-                legacy_notify_argv: Some(vec!["".to_string()]),
-            })
-            .after_agent
-            .is_empty()
-        );
-        assert_eq!(
-            Hooks::new(HooksConfig {
-                legacy_notify_argv: Some(vec!["notify-send".to_string()]),
-            })
-            .after_agent
-            .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_executes_hook() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = Hooks {
-            after_agent: vec![counting_success_hook(&calls, "counting")],
-            ..Hooks::default()
-        };
-
-        let outcomes = hooks.dispatch(hook_payload("1")).await;
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].hook_name, "counting");
-        assert!(matches!(outcomes[0].result, HookResult::Success));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn default_hook_is_noop_and_continues() {
-        let payload = hook_payload("d");
-        let outcome = Hook::default().execute(&payload).await;
-        assert_eq!(outcome.hook_name, "default");
-        assert!(matches!(outcome.result, HookResult::Success));
-    }
-
-    #[tokio::test]
-    async fn dispatch_executes_multiple_hooks_for_same_event() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = Hooks {
-            after_agent: vec![
-                counting_success_hook(&calls, "counting-1"),
-                counting_success_hook(&calls, "counting-2"),
-            ],
-            ..Hooks::default()
-        };
-
-        let outcomes = hooks.dispatch(hook_payload("2")).await;
-        assert_eq!(outcomes.len(), 2);
-        assert_eq!(outcomes[0].hook_name, "counting-1");
-        assert_eq!(outcomes[1].hook_name, "counting-2");
-        assert!(matches!(outcomes[0].result, HookResult::Success));
-        assert!(matches!(outcomes[1].result, HookResult::Success));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn dispatch_stops_when_hook_requests_abort() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = Hooks {
-            after_agent: vec![
-                failing_abort_hook(&calls, "abort", "hook failed"),
-                counting_success_hook(&calls, "counting"),
-            ],
-            ..Hooks::default()
-        };
-
-        let outcomes = hooks.dispatch(hook_payload("3")).await;
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].hook_name, "abort");
-        assert!(matches!(outcomes[0].result, HookResult::FailedAbort(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn dispatch_executes_after_tool_use_hooks() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = Hooks {
-            after_tool_use: vec![counting_success_hook(&calls, "counting")],
-            ..Hooks::default()
-        };
-
-        let outcomes = hooks.dispatch(after_tool_use_payload("p")).await;
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].hook_name, "counting");
-        assert!(matches!(outcomes[0].result, HookResult::Success));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn dispatch_continues_after_continueable_failure() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = Hooks {
-            after_agent: vec![
-                failing_continue_hook(&calls, "failing", "hook failed"),
-                counting_success_hook(&calls, "counting"),
-            ],
-            ..Hooks::default()
-        };
-
-        let outcomes = hooks.dispatch(hook_payload("err")).await;
-        assert_eq!(outcomes.len(), 2);
-        assert_eq!(outcomes[0].hook_name, "failing");
-        assert!(matches!(outcomes[0].result, HookResult::FailedContinue(_)));
-        assert_eq!(outcomes[1].hook_name, "counting");
-        assert!(matches!(outcomes[1].result, HookResult::Success));
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_after_tool_use_failure_outcome() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let hooks = Hooks {
-            after_tool_use: vec![failing_continue_hook(
-                &calls,
-                "failing",
-                "after_tool_use hook failed",
-            )],
-            ..Hooks::default()
-        };
-
-        let outcomes = hooks.dispatch(after_tool_use_payload("err-tool")).await;
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].hook_name, "failing");
-        assert!(matches!(outcomes[0].result, HookResult::FailedContinue(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg(not(windows))]
-    #[tokio::test]
-    async fn hook_executes_program_with_payload_argument_unix() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let payload_path = temp_dir.path().join("payload.json");
-        let payload_path_arg = payload_path.to_string_lossy().into_owned();
-        let hook = Hook {
-            name: "write_payload".to_string(),
-            func: Arc::new(move |payload: &HookPayload| {
-                let payload_path_arg = payload_path_arg.clone();
-                Box::pin(async move {
-                    let json = to_string(payload).expect("serialize hook payload");
-                    let mut command = command_from_argv(&[
-                        "/bin/sh".to_string(),
-                        "-c".to_string(),
-                        "printf '%s' \"$2\" > \"$1\"".to_string(),
-                        "sh".to_string(),
-                        payload_path_arg,
-                        json,
-                    ])
-                    .expect("build command");
-                    command.status().await.expect("run hook command");
-                    HookResult::Success
-                })
-            }),
-        };
-
-        let payload = hook_payload("4");
-        let expected = to_string(&payload)?;
-
-        let hooks = Hooks {
-            after_agent: vec![hook],
-            ..Hooks::default()
-        };
-        let outcomes = hooks.dispatch(payload).await;
-        assert_eq!(outcomes.len(), 1);
-        assert!(matches!(outcomes[0].result, HookResult::Success));
-
-        let contents = timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(contents) = fs::read_to_string(&payload_path)
-                    && !contents.is_empty()
-                {
-                    return contents;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-
-        assert_eq!(contents, expected);
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn hook_executes_program_with_payload_argument_windows() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let payload_path = temp_dir.path().join("payload.json");
-        let payload_path_arg = payload_path.to_string_lossy().into_owned();
-        let script_path = temp_dir.path().join("write_payload.ps1");
-        fs::write(&script_path, "[IO.File]::WriteAllText($args[0], $args[1])")?;
-        let script_path_arg = script_path.to_string_lossy().into_owned();
-        let hook = Hook {
-            name: "write_payload".to_string(),
-            func: Arc::new(move |payload: &HookPayload| {
-                let payload_path_arg = payload_path_arg.clone();
-                let script_path_arg = script_path_arg.clone();
-                Box::pin(async move {
-                    let json = to_string(payload).expect("serialize hook payload");
-                    let mut command = command_from_argv(&[
-                        "powershell.exe".to_string(),
-                        "-NoLogo".to_string(),
-                        "-NoProfile".to_string(),
-                        "-ExecutionPolicy".to_string(),
-                        "Bypass".to_string(),
-                        "-File".to_string(),
-                        script_path_arg,
-                        payload_path_arg,
-                        json,
-                    ])
-                    .expect("build command");
-                    command.status().await.expect("run hook command");
-                    HookResult::Success
-                })
-            }),
-        };
-
-        let payload = hook_payload("4");
-        let expected = to_string(&payload)?;
-
-        let hooks = Hooks {
-            after_agent: vec![hook],
-            ..Hooks::default()
-        };
-        let outcomes = hooks.dispatch(payload).await;
-        assert_eq!(outcomes.len(), 1);
-        assert!(matches!(outcomes[0].result, HookResult::Success));
-
-        let contents = timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(contents) = fs::read_to_string(&payload_path)
-                    && !contents.is_empty()
-                {
-                    return contents;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-
-        assert_eq!(contents, expected);
-        Ok(())
-    }
 }

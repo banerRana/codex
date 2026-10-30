@@ -12,6 +12,30 @@ pub fn shlex_join(tokens: &[String]) -> String {
         .unwrap_or_else(|_| "<command included NUL byte>".to_string())
 }
 
+/// Tokenizes a PowerShell command while preserving Windows paths and reader aliases.
+pub fn tokenize_powershell_command(command: &str) -> Vec<String> {
+    let normalized = command.replace('\\', "/");
+    let mut tokens = shlex_split(&normalized)
+        .unwrap_or_else(|| normalized.split_whitespace().map(str::to_string).collect());
+    if let Some(executable) = tokens.first_mut()
+        && matches!(
+            executable.to_ascii_lowercase().as_str(),
+            "get-content" | "gc" | "type"
+        )
+    {
+        *executable = "Get-Content".to_owned();
+        // POSIX shlex must not silently rewrite a PowerShell file path.
+        if tokens
+            .iter()
+            .skip(1)
+            .any(|argument| !normalized.contains(argument))
+        {
+            return Vec::new();
+        }
+    }
+    tokens
+}
+
 /// Extracts the shell and script from a command, regardless of platform
 pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
     extract_bash_command(command).or_else(|| extract_powershell_command(command))
@@ -37,7 +61,26 @@ pub fn parse_command(command: &[String]) -> Vec<ParsedCommand> {
         }
         deduped.push(cmd);
     }
-    deduped
+    if deduped
+        .iter()
+        .any(|cmd| matches!(cmd, ParsedCommand::Unknown { .. }))
+    {
+        vec![single_unknown_for_command(command)]
+    } else {
+        deduped
+    }
+}
+
+fn single_unknown_for_command(command: &[String]) -> ParsedCommand {
+    if let Some((_, shell_command)) = extract_shell_command(command) {
+        ParsedCommand::Unknown {
+            cmd: shell_command.to_string(),
+        }
+    } else {
+        ParsedCommand::Unknown {
+            cmd: shlex_join(command),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -119,7 +162,7 @@ mod tests {
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
             vec![ParsedCommand::Unknown {
-                cmd: "git status".to_string(),
+                cmd: inner.to_string(),
             }],
         );
     }
@@ -141,24 +184,9 @@ mod tests {
             "rg --version && node -v && pnpm -v && rg --files | wc -l && rg --files | head -n 40";
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
-            vec![
-                // Expect commands in left-to-right execution order
-                ParsedCommand::Search {
-                    cmd: "rg --version".to_string(),
-                    query: None,
-                    path: None,
-                },
-                ParsedCommand::Unknown {
-                    cmd: "node -v".to_string(),
-                },
-                ParsedCommand::Unknown {
-                    cmd: "pnpm -v".to_string(),
-                },
-                ParsedCommand::ListFiles {
-                    cmd: "rg --files".to_string(),
-                    path: None,
-                },
-            ],
+            vec![ParsedCommand::Unknown {
+                cmd: inner.to_string(),
+            }],
         );
     }
 
@@ -218,16 +246,33 @@ mod tests {
         let inner = r#"rg -l QkBindingController presentation/src/main/java | xargs perl -pi -e 's/QkBindingController/QkController/g'"#;
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
-            vec![
-                ParsedCommand::Search {
-                    cmd: "rg -l QkBindingController presentation/src/main/java".to_string(),
-                    query: Some("QkBindingController".to_string()),
-                    path: Some("java".to_string()),
-                },
-                ParsedCommand::Unknown {
-                    cmd: "xargs perl -pi -e s/QkBindingController/QkController/g".to_string(),
-                },
-            ],
+            vec![ParsedCommand::Unknown {
+                cmd: inner.to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn collapses_plain_pipeline_when_any_stage_is_unknown() {
+        let command = shlex_split_safe(
+            "rg -l QkBindingController presentation/src/main/java | xargs perl -pi -e 's/QkBindingController/QkController/g'",
+        );
+        assert_parsed(
+            &command,
+            vec![ParsedCommand::Unknown {
+                cmd: shlex_join(&command),
+            }],
+        );
+    }
+
+    #[test]
+    fn collapses_pipeline_with_helper_when_later_stage_is_unknown() {
+        let command = shlex_split_safe("rg --files | nl -ba | foo");
+        assert_parsed(
+            &command,
+            vec![ParsedCommand::Unknown {
+                cmd: shlex_join(&command),
+            }],
         );
     }
 
@@ -395,7 +440,7 @@ mod tests {
         assert_parsed(
             &shlex_split_safe("bash -lc 'cd foo && bar'"),
             vec![ParsedCommand::Unknown {
-                cmd: "bar".to_string(),
+                cmd: "cd foo && bar".to_string(),
             }],
         );
     }
@@ -812,6 +857,34 @@ mod tests {
     }
 
     #[test]
+    fn keeps_mutating_sed_in_compound_command() {
+        for sed_command in [
+            "sed -n -i.bak 1p secret.txt",
+            "sed -ni.bak 1p secret.txt",
+            "sed -Eni.bak 1p secret.txt",
+        ] {
+            let inner = format!("cat README.md && {sed_command}");
+            assert_parsed(
+                &vec_str(&["bash", "-lc", &inner]),
+                vec![ParsedCommand::Unknown { cmd: inner }],
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_sed_operands_after_double_dash_when_checking_mutation() {
+        let inner = "cat README.md && sed 's/a/x/' -- -input.txt";
+        assert_parsed(
+            &vec_str(&["bash", "-lc", inner]),
+            vec![ParsedCommand::Read {
+                cmd: "cat README.md".to_string(),
+                name: "README.md".to_string(),
+                path: PathBuf::from("README.md"),
+            }],
+        );
+    }
+
+    #[test]
     fn empty_tokens_is_not_small() {
         let empty: Vec<String> = Vec::new();
         assert!(!is_small_formatting_command(&empty));
@@ -920,85 +993,6 @@ mod tests {
                 path: None,
             }],
         );
-    }
-
-    #[test]
-    fn trim_on_semicolon() {
-        assert_parsed(
-            &shlex_split_safe("rg foo ; echo done"),
-            vec![
-                ParsedCommand::Search {
-                    cmd: "rg foo".to_string(),
-                    query: Some("foo".to_string()),
-                    path: None,
-                },
-                ParsedCommand::Unknown {
-                    cmd: "echo done".to_string(),
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn split_on_or_connector() {
-        // Ensure we split commands on the logical OR operator as well.
-        assert_parsed(
-            &shlex_split_safe("rg foo || echo done"),
-            vec![
-                ParsedCommand::Search {
-                    cmd: "rg foo".to_string(),
-                    query: Some("foo".to_string()),
-                    path: None,
-                },
-                ParsedCommand::Unknown {
-                    cmd: "echo done".to_string(),
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn parses_mixed_sequence_with_pipes_semicolons_and_or() {
-        // Provided long command sequence combining sequencing, pipelines, and ORs.
-        let inner = "pwd; ls -la; rg --files -g '!target' | wc -l; rg -n '^\\[workspace\\]' -n Cargo.toml || true; rg -n '^\\[package\\]' -n */Cargo.toml || true; cargo --version; rustc --version; cargo clippy --workspace --all-targets --all-features -q";
-        let args = vec_str(&["bash", "-lc", inner]);
-
-        let expected = vec![
-            ParsedCommand::Unknown {
-                cmd: "pwd".to_string(),
-            },
-            ParsedCommand::ListFiles {
-                cmd: shlex_join(&shlex_split_safe("ls -la")),
-                path: None,
-            },
-            ParsedCommand::ListFiles {
-                cmd: shlex_join(&shlex_split_safe("rg --files -g '!target'")),
-                path: None,
-            },
-            ParsedCommand::Search {
-                cmd: shlex_join(&shlex_split_safe("rg -n '^\\[workspace\\]' -n Cargo.toml")),
-                query: Some("^\\[workspace\\]".to_string()),
-                path: Some("Cargo.toml".to_string()),
-            },
-            ParsedCommand::Search {
-                cmd: shlex_join(&shlex_split_safe("rg -n '^\\[package\\]' -n */Cargo.toml")),
-                query: Some("^\\[package\\]".to_string()),
-                path: Some("Cargo.toml".to_string()),
-            },
-            ParsedCommand::Unknown {
-                cmd: shlex_join(&shlex_split_safe("cargo --version")),
-            },
-            ParsedCommand::Unknown {
-                cmd: shlex_join(&shlex_split_safe("rustc --version")),
-            },
-            ParsedCommand::Unknown {
-                cmd: shlex_join(&shlex_split_safe(
-                    "cargo clippy --workspace --all-targets --all-features -q",
-                )),
-            },
-        ];
-
-        assert_parsed(&args, expected);
     }
 
     #[test]
@@ -1304,6 +1298,102 @@ mod tests {
     }
 
     #[test]
+    fn powershell_file_reads_are_classified() {
+        for (shell, script, path) in [
+            (
+                "powershell",
+                r"Get-Content C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r#"get-content -Raw "C:\skills and plugins\SKILL.md""#,
+                "C:/skills and plugins/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content 'C:\skills and plugins\SKILL.md'",
+                "C:/skills and plugins/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content -Path C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content -LiteralPath C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content C:\skills\demo\SKILL.md -Raw",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content -Raw -LiteralPath C:\skills\demo\SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                r"Get-Content C:\workspace\README.md",
+                "C:/workspace/README.md",
+            ),
+            (
+                "powershell",
+                "gc C:/skills/demo/SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                "powershell",
+                "type C:/skills/demo/SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+            (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "Get-Content C:/skills/demo/SKILL.md",
+                "C:/skills/demo/SKILL.md",
+            ),
+        ] {
+            assert_parsed(
+                &vec_str(&[shell, "-NoProfile", "-Command", script]),
+                vec![ParsedCommand::Read {
+                    cmd: script.to_string(),
+                    name: PathBuf::from(path)
+                        .file_name()
+                        .expect("file path")
+                        .to_string_lossy()
+                        .into_owned(),
+                    path: PathBuf::from(path),
+                }],
+            );
+        }
+    }
+
+    #[test]
+    fn complex_powershell_file_reads_are_intentionally_not_classified() {
+        for script in [
+            r"Get-Content 'C:\Users\O''Brien\skill\SKILL.md'",
+            r#"Get-Content "$(Remove-Item C:/important)/skills/demo/SKILL.md""#,
+            "Get-Content -ReadCount:([IO.File]::Delete('C:/important')) C:/skills/demo/SKILL.md",
+            "Get-Content C:/Users/Alice/.ssh/id_rsa,C:/skills/demo/SKILL.md",
+            "Get-Content C:/skills/demo/SKILL.md -Raw; Remove-Item C:/important",
+            "Get-Content C:/skills/demo/SKILL.md C:/important",
+            "Get-Content C:/skills/*/SKILL.md",
+            "Get-Content -Encoding UTF8 C:/skills/demo/SKILL.md",
+            "Get-Content -Raw",
+        ] {
+            assert_parsed(
+                &vec_str(&["powershell", "-Command", script]),
+                vec![ParsedCommand::Unknown {
+                    cmd: script.to_string(),
+                }],
+            );
+        }
+    }
+
+    #[test]
     fn pwsh_with_noprofile_and_c_alias_is_stripped() {
         assert_parsed(
             &vec_str(&["pwsh", "-NoProfile", "-c", "Write-Host hi"]),
@@ -1335,7 +1425,29 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
         return commands;
     }
 
-    if let Some((_, script)) = extract_powershell_command(command) {
+    let powershell_command = command
+        .first()
+        .filter(|shell| shell.contains('\\'))
+        .map(|shell| {
+            let mut normalized = command.to_vec();
+            normalized[0] = shell.rsplit(['/', '\\']).next().unwrap_or(shell).to_owned();
+            normalized
+        });
+    if let Some((_, script)) =
+        extract_powershell_command(powershell_command.as_deref().unwrap_or(command))
+    {
+        let tokens = tokenize_powershell_command(script);
+        if tokens
+            .first()
+            .is_some_and(|executable| executable == "Get-Content")
+            && let [ParsedCommand::Read { name, path, .. }] = parse_command_impl(&tokens).as_slice()
+        {
+            return vec![ParsedCommand::Read {
+                cmd: script.to_string(),
+                name: name.clone(),
+                path: path.clone(),
+            }];
+        }
         return vec![ParsedCommand::Unknown {
             cmd: script.to_string(),
         }];
@@ -1476,7 +1588,8 @@ fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
 
 fn sed_read_path(args: &[String]) -> Option<String> {
     let args_no_connector = trim_at_connector(args);
-    if !args_no_connector.iter().any(|arg| arg == "-n") {
+    if sed_has_in_place_flag(&args_no_connector) || !args_no_connector.iter().any(|arg| arg == "-n")
+    {
         return None;
     }
     let mut has_range_script = false;
@@ -1805,7 +1918,8 @@ fn cd_target(args: &[String]) -> Option<String> {
     target
 }
 
-fn is_pathish(s: &str) -> bool {
+/// Returns whether a command token has an explicit path shape.
+pub fn is_pathish(s: &str) -> bool {
     s == "."
         || s == ".."
         || s.starts_with("./")
@@ -1876,7 +1990,11 @@ fn parse_find_query_and_path(tail: &[String]) -> (Option<String>, Option<String>
 fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>> {
     // Only handle bash/zsh here; PowerShell is stripped separately without bash parsing.
     let (_, script) = extract_bash_command(original)?;
+    Some(parse_shell_script(script))
+}
 
+/// Parses command metadata from a Bash-compatible shell script.
+pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
     if let Some(tree) = try_parse_shell(script)
         && let Some(all_commands) = try_parse_word_only_commands_sequence(&tree, script)
         && !all_commands.is_empty()
@@ -1889,9 +2007,9 @@ fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>> {
         // Commands arrive in source order; drop formatting helpers while preserving it.
         let filtered_commands = drop_small_formatting_commands(all_commands);
         if filtered_commands.is_empty() {
-            return Some(vec![ParsedCommand::Unknown {
+            return vec![ParsedCommand::Unknown {
                 cmd: script.to_string(),
-            }]);
+            }];
         }
         // Build parsed commands, tracking `cd` segments to compute effective file paths.
         let mut commands: Vec<ParsedCommand> = Vec::new();
@@ -1926,6 +2044,7 @@ fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>> {
             };
             commands.push(parsed);
         }
+
         if commands.len() > 1 {
             commands.retain(|pc| !matches!(pc, ParsedCommand::Unknown { cmd } if cmd == "true"));
             // Apply the same simplifications used for non-bash parsing, e.g., drop leading `cd`.
@@ -1996,11 +2115,11 @@ fn parse_shell_lc_commands(original: &[String]) -> Option<Vec<ParsedCommand>> {
                 })
                 .collect();
         }
-        return Some(commands);
+        return commands;
     }
-    Some(vec![ParsedCommand::Unknown {
+    vec![ParsedCommand::Unknown {
         cmd: script.to_string(),
-    }])
+    }]
 }
 
 /// Return true if this looks like a small formatting helper in a pipeline.
@@ -2068,8 +2187,10 @@ fn is_small_formatting_command(tokens: &[String]) -> bool {
         }
         "sed" => {
             // Keep `sed -n <range> file` (treated as a file read elsewhere);
-            // otherwise consider it a formatting helper in a pipeline.
-            sed_read_path(&tokens[1..]).is_none()
+            // keep in-place mutations as unknown actions; otherwise consider it
+            // a formatting helper in a pipeline.
+            let args = &tokens[1..];
+            !sed_has_in_place_flag(args) && sed_read_path(args).is_none()
         }
         _ => false,
     }
@@ -2110,17 +2231,55 @@ fn xargs_is_mutating_subcommand(tokens: &[String]) -> bool {
         return false;
     };
     match head.as_str() {
-        "perl" | "ruby" => xargs_has_in_place_flag(tail),
-        "sed" => xargs_has_in_place_flag(tail) || tail.iter().any(|token| token == "--in-place"),
+        "perl" | "ruby" => has_in_place_flag(tail),
+        "sed" => sed_has_in_place_flag(tail),
         "rg" => tail.iter().any(|token| token == "--replace"),
         _ => false,
     }
 }
 
-fn xargs_has_in_place_flag(tokens: &[String]) -> bool {
+fn has_in_place_flag(tokens: &[String]) -> bool {
     tokens.iter().any(|token| {
-        token == "-i" || token.starts_with("-i") || token == "-pi" || token.starts_with("-pi")
+        token == "-i"
+            || token.starts_with("-i")
+            || token == "-pi"
+            || token.starts_with("-pi")
+            || token == "--in-place"
+            || token.starts_with("--in-place=")
     })
+}
+
+fn sed_has_in_place_flag(tokens: &[String]) -> bool {
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            "--" => break,
+            "-e" | "-f" | "--expression" | "--file" => {
+                let _ = tokens.next();
+            }
+            "--in-place" => return true,
+            token if token.starts_with("--in-place=") => return true,
+            token if token.starts_with("--") => {}
+            token => {
+                let Some(short_options) = token.strip_prefix('-') else {
+                    continue;
+                };
+                for (index, option) in short_options.char_indices() {
+                    match option {
+                        'i' => return true,
+                        'e' | 'f' => {
+                            if index + option.len_utf8() == short_options.len() {
+                                let _ = tokens.next();
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn drop_small_formatting_commands(mut commands: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -2305,8 +2464,32 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 path,
             }
         }
-        Some((head, tail)) if head == "cat" => {
-            if let Some(path) = single_non_flag_operand(tail, &[]) {
+        Some((head, tail)) if head == "cat" || head.eq_ignore_ascii_case("Get-Content") => {
+            let path = if head == "cat" {
+                single_non_flag_operand(tail, &[])
+            } else {
+                // Intentionally miss complex reads: conservative presentation should not
+                // require implementing PowerShell's full expression and argument grammar.
+                if tail.iter().all(|argument| {
+                    !argument.starts_with('-')
+                        || ["-Raw", "-Path", "-LiteralPath"]
+                            .iter()
+                            .any(|flag| argument.eq_ignore_ascii_case(flag))
+                }) {
+                    single_non_flag_operand(tail, &[])
+                } else {
+                    None
+                }
+                .filter(|path| {
+                    !path.is_empty()
+                        && !path.starts_with('-')
+                        && path.chars().all(|character| {
+                            character.is_alphanumeric()
+                                || matches!(character, ' ' | '/' | '\\' | '.' | '-' | '_' | ':')
+                        })
+                })
+            };
+            if let Some(path) = path {
                 let name = short_display_path(&path);
                 ParsedCommand::Read {
                     cmd: shlex_join(main_cmd),

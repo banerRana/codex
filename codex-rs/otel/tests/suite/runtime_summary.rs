@@ -1,11 +1,12 @@
-use codex_otel::OtelManager;
+use codex_otel::MetricsClient;
+use codex_otel::MetricsConfig;
+use codex_otel::Result;
 use codex_otel::RuntimeMetricTotals;
 use codex_otel::RuntimeMetricsSummary;
+use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
-use codex_otel::metrics::MetricsClient;
-use codex_otel::metrics::MetricsConfig;
-use codex_otel::metrics::Result;
 use codex_protocol::ThreadId;
+use codex_protocol::ToolName;
 use codex_protocol::protocol::SessionSource;
 use eventsource_stream::Event as StreamEvent;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -20,15 +21,15 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
         MetricsConfig::in_memory("test", "codex-cli", env!("CARGO_PKG_VERSION"), exporter)
             .with_runtime_reader(),
     )?;
-    let manager = OtelManager::new(
+    let manager = SessionTelemetry::new(
         ThreadId::new(),
         "gpt-5.1",
         "gpt-5.1",
         Some("account-id".to_string()),
-        None,
+        /*account_email*/ None,
         Some(TelemetryAuthMode::ApiKey),
         "test_originator".to_string(),
-        true,
+        /*log_user_prompts*/ true,
         "tty".to_string(),
         SessionSource::Cli,
     )
@@ -37,16 +38,38 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
     manager.reset_runtime_metrics();
 
     manager.tool_result_with_tags(
-        "shell",
+        &ToolName::plain("shell"),
         "call-1",
         "{\"cmd\":\"echo\"}",
         Duration::from_millis(250),
-        true,
+        /*success*/ true,
         "ok",
         &[],
+        /*extra_trace_fields*/ &[],
     );
-    manager.record_api_request(1, Some(200), None, Duration::from_millis(300));
-    manager.record_websocket_request(Duration::from_millis(400), None);
+    manager.record_api_request(
+        /*attempt*/ 1,
+        Some(200),
+        /*error*/ None,
+        Duration::from_millis(300),
+        /*auth_header_attached*/ false,
+        /*auth_header_name*/ None,
+        /*retry_after_unauthorized*/ false,
+        /*recovery_mode*/ None,
+        /*recovery_phase*/ None,
+        "/responses",
+        /*request_id*/ None,
+        /*cf_ray*/ None,
+        /*auth_error*/ None,
+        /*auth_error_code*/ None,
+        /*agent_identity_telemetry*/ None,
+    );
+    manager.record_websocket_request(
+        Duration::from_millis(400),
+        /*error*/ None,
+        /*connection_reused*/ false,
+        /*agent_identity_telemetry*/ None,
+    );
     let sse_response: std::result::Result<
         Option<std::result::Result<StreamEvent, eventsource_stream::EventStreamError<&str>>>,
         tokio::time::error::Elapsed,
@@ -68,10 +91,20 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
         Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>,
         codex_api::ApiError,
     > = Ok(Some(Ok(Message::Text(
-        r#"{"type":"responsesapi.websocket_timing","timing_metrics":{"responses_duration_excl_engine_and_client_tool_time_ms":124,"engine_service_total_ms":457,"engine_iapi_ttft_total_ms":211,"engine_service_ttft_total_ms":233,"engine_iapi_tbt_across_engine_calls_ms":377,"engine_service_tbt_across_engine_calls_ms":399}}"#
+        r#"{"type":"responsesapi.websocket_timing","timing_metrics":{"responses_duration_excl_engine_and_client_tool_time_ms":124.25,"engine_service_total_ms":457,"engine_iapi_ttft_total_ms":211,"engine_service_ttft_total_ms":233,"engine_iapi_tbt_across_engine_calls_ms":2.450638,"engine_service_tbt_across_engine_calls_ms":5.267279}}"#
             .into(),
     ))));
     manager.record_websocket_event(&ws_timing_response, Duration::from_millis(20));
+    manager.record_duration(
+        "codex.turn.ttft.duration_ms",
+        Duration::from_millis(95),
+        &[],
+    );
+    manager.record_duration(
+        "codex.turn.ttfm.duration_ms",
+        Duration::from_millis(180),
+        &[],
+    );
 
     let summary = manager
         .runtime_metrics_summary()
@@ -101,8 +134,10 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
         responses_api_inference_time_ms: 457,
         responses_api_engine_iapi_ttft_ms: 211,
         responses_api_engine_service_ttft_ms: 233,
-        responses_api_engine_iapi_tbt_ms: 377,
-        responses_api_engine_service_tbt_ms: 399,
+        responses_api_engine_iapi_tbt_ms: 2.450638,
+        responses_api_engine_service_tbt_ms: 5.267279,
+        turn_ttft_ms: 95,
+        turn_ttfm_ms: 180,
     };
     assert_eq!(summary, expected);
 

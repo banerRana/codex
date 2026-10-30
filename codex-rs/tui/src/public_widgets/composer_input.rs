@@ -13,6 +13,7 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ChatComposer;
 use crate::bottom_pane::InputResult;
+use crate::bottom_pane::QueuedInputAction;
 use crate::render::renderable::Renderable;
 
 /// Action returned from feeding a key event into the ComposerInput.
@@ -37,7 +38,13 @@ impl ComposerInput {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let sender = AppEventSender::new(tx.clone());
         // `enhanced_keys_supported=true` enables Shift+Enter newline hint/behavior.
-        let inner = ChatComposer::new(true, sender, true, "Compose new task".to_string(), false);
+        let inner = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ true,
+            "Compose new task".to_string(),
+            /*disable_paste_burst*/ false,
+        );
         Self { inner, _tx: tx, rx }
     }
 
@@ -56,6 +63,14 @@ impl ComposerInput {
     pub fn input(&mut self, key: KeyEvent) -> ComposerAction {
         let action = match self.inner.handle_key_event(key).0 {
             InputResult::Submitted { text, .. } => ComposerAction::Submitted(text),
+            InputResult::Queued {
+                text,
+                text_elements,
+                action: QueuedInputAction::Literal,
+                pending_pastes,
+            } => ComposerAction::Submitted(
+                ChatComposer::expand_pending_pastes(&text, text_elements, &pending_pastes).0,
+            ),
             _ => ComposerAction::None,
         };
         self.drain_app_events();
@@ -80,7 +95,7 @@ impl ComposerInput {
 
     /// Clear any previously set custom hint items and restore the default hints.
     pub fn clear_hint_items(&mut self) {
-        self.inner.set_footer_hint_override(None);
+        self.inner.set_footer_hint_override(/*items*/ None);
     }
 
     /// Desired height (in rows) for a given width.
@@ -101,6 +116,11 @@ impl ComposerInput {
     /// Return true if a paste-burst detection is currently active.
     pub fn is_in_paste_burst(&self) -> bool {
         self.inner.is_in_paste_burst()
+    }
+
+    /// Delay until validation feedback expires and needs a redraw.
+    pub fn footer_flash_delay(&self) -> Option<Duration> {
+        self.inner.footer_flash_delay()
     }
 
     /// Flush a pending paste-burst if the inter-key timeout has elapsed.

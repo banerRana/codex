@@ -35,13 +35,16 @@ use nucleo::pattern::AtomKind;
 use nucleo::pattern::Pattern;
 
 mod cli;
+mod snapshot;
 
 pub use cli::Cli;
 
 /// A single match result returned from the search.
 ///
 /// * `score` – Relevance score returned by `nucleo`.
-/// * `path`  – Path to the matched file (relative to the search directory).
+/// * `path`  – Path to the matched entry (file or directory), relative to the
+///   search directory.
+/// * `match_type` – Whether this match is a file or directory.
 /// * `indices` – Optional list of character indices that matched the query.
 ///   These are only filled when the caller of [`run`] sets
 ///   `options.compute_indices` to `true`. The indices vector follows the
@@ -52,9 +55,33 @@ pub use cli::Cli;
 pub struct FileMatch {
     pub score: u32,
     pub path: PathBuf,
+    pub match_type: MatchType,
     pub root: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indices: Option<Vec<u32>>, // Sorted & deduplicated when present
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchType {
+    File,
+    Directory,
+}
+
+/// Carries the selected root and entry type without duplicating ASCII matcher paths.
+enum IndexedEntry {
+    Ascii {
+        root_idx: usize,
+        match_type: MatchType,
+    },
+    Unicode(Box<UnicodeEntry>),
+}
+
+// Unicode matcher columns retain only one codepoint per grapheme.
+struct UnicodeEntry {
+    root_idx: usize,
+    relative_path: Box<str>,
+    match_type: MatchType,
 }
 
 impl FileMatch {
@@ -92,6 +119,13 @@ pub struct FileSearchOptions {
     pub exclude: Vec<String>,
     pub threads: NonZero<usize>,
     pub compute_indices: bool,
+    /// Toggle ignore-file processing in the walker.
+    ///
+    /// When enabled, `.gitignore` files are scoped by
+    /// `WalkBuilder::require_git(true)`, so they are honored only when the
+    /// traversed path is inside a git repository. When disabled, the walker
+    /// turns off `.gitignore`, git-global/exclude rules, `.ignore`, and
+    /// parent-directory ignore scanning.
     pub respect_gitignore: bool,
 }
 
@@ -178,10 +212,10 @@ pub fn create_session(
         threads: threads.get(),
         compute_indices,
         respect_gitignore,
-        cancelled: cancelled.clone(),
+        cancelled,
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
-        work_tx: work_tx.clone(),
+        work_tx,
     });
 
     let matcher_inner = inner.clone();
@@ -254,7 +288,7 @@ pub async fn run_main<T: Reporter>(
             compute_indices,
             respect_gitignore: true,
         },
-        None,
+        /*cancel_flag*/ None,
     )?;
     let match_count = matches.len();
     let matches_truncated = total_match_count > match_count;
@@ -319,7 +353,7 @@ where
 fn create_pattern(pattern: &str) -> Pattern {
     Pattern::new(
         pattern,
-        CaseMatching::Smart,
+        CaseMatching::Ignore,
         Normalization::Smart,
         AtomKind::Fuzzy,
     )
@@ -379,10 +413,22 @@ fn get_file_path<'a>(path: &'a Path, search_directories: &[PathBuf]) -> Option<(
     rel_path.to_str().map(|p| (root_idx, p))
 }
 
+/// Walks the search directories and feeds discovered paths into `nucleo`
+/// via the injector.
+///
+/// The walker uses `require_git(true)` to match git's own ignore semantics:
+/// git never reads `.gitignore` files from directories above the repository
+/// root. Without this flag, the `ignore` crate reads `.gitignore` files from
+/// *all* ancestor directories—a deliberate divergence from git intended for
+/// non-git use cases—allowing a broad parent ignore (e.g. `~/.gitignore`
+/// containing `*`) to silently suppress every file in the walk.
+///
+/// When `respect_gitignore` is `false`, all git-related ignore processing is
+/// disabled regardless of this flag.
 fn walker_worker(
     inner: Arc<SessionInner>,
     override_matcher: Option<ignore::overrides::Override>,
-    injector: Injector<Arc<str>>,
+    injector: Injector<IndexedEntry>,
 ) {
     let Some(first_root) = inner.search_directories.first() else {
         let _ = inner.work_tx.send(WorkSignal::WalkComplete);
@@ -399,8 +445,9 @@ fn walker_worker(
         .hidden(false)
         // Follow symlinks to search their contents.
         .follow_links(true)
-        // Don't require git to be present to apply to apply git-related ignore rules.
-        .require_git(false);
+        // Keep ignore behavior aligned with git repositories: only apply
+        // gitignore rules when a git context exists.
+        .require_git(true);
     if !inner.respect_gitignore {
         walk_builder
             .git_ignore(false)
@@ -428,16 +475,29 @@ fn walker_worker(
                 Ok(entry) => entry,
                 Err(_) => return ignore::WalkState::Continue,
             };
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            let path = entry.path();
+            if path.to_str().is_none() {
                 return ignore::WalkState::Continue;
             }
-            let path = entry.path();
-            let Some(full_path) = path.to_str() else {
-                return ignore::WalkState::Continue;
-            };
-            if let Some((_, relative_path)) = get_file_path(path, &search_directories) {
-                injector.push(Arc::from(full_path), |_, cols| {
-                    cols[0] = Utf32String::from(relative_path);
+            if let Some((root_idx, relative_path)) = get_file_path(path, &search_directories) {
+                let match_type = match entry.file_type() {
+                    Some(file_type) if file_type.is_dir() => MatchType::Directory,
+                    _ => MatchType::File,
+                };
+                let column = Utf32String::from(relative_path);
+                let indexed_entry = match &column {
+                    Utf32String::Ascii(_) => IndexedEntry::Ascii {
+                        root_idx,
+                        match_type,
+                    },
+                    Utf32String::Unicode(_) => IndexedEntry::Unicode(Box::new(UnicodeEntry {
+                        root_idx,
+                        relative_path: Box::from(relative_path),
+                        match_type,
+                    })),
+                };
+                injector.push(indexed_entry, |_, cols| {
+                    cols[0] = column;
                 });
             }
             n += 1;
@@ -456,7 +516,7 @@ fn walker_worker(
 fn matcher_worker(
     inner: Arc<SessionInner>,
     work_rx: Receiver<WorkSignal>,
-    mut nucleo: Nucleo<Arc<str>>,
+    mut nucleo: Nucleo<IndexedEntry>,
 ) -> anyhow::Result<()> {
     const TICK_TIMEOUT_MS: u64 = 10;
     let config = Config::DEFAULT.match_paths();
@@ -481,7 +541,7 @@ fn matcher_worker(
                         nucleo.pattern.reparse(
                             0,
                             &query,
-                            CaseMatching::Smart,
+                            CaseMatching::Ignore,
                             Normalization::Smart,
                             append,
                         );
@@ -510,44 +570,15 @@ fn matcher_worker(
             recv(next_notify) -> _ => {
                 will_notify = false;
                 let status = nucleo.tick(TICK_TIMEOUT_MS);
-                if status.changed {
-                    let snapshot = nucleo.snapshot();
-                    let limit = inner.limit.min(snapshot.matched_item_count() as usize);
-                    let pattern = snapshot.pattern().column_pattern(0);
-                    let matches: Vec<_> = snapshot
-                        .matches()
-                        .iter()
-                        .take(limit)
-                        .filter_map(|match_| {
-                            let item = snapshot.get_item(match_.idx)?;
-                            let full_path = item.data.as_ref();
-                            let (root_idx, relative_path) = get_file_path(Path::new(full_path), &inner.search_directories)?;
-                            let indices = if let Some(indices_matcher) = indices_matcher.as_mut() {
-                                let mut idx_vec = Vec::<u32>::new();
-                                let haystack = item.matcher_columns[0].slice(..);
-                                let _ = pattern.indices(haystack, indices_matcher, &mut idx_vec);
-                                idx_vec.sort_unstable();
-                                idx_vec.dedup();
-                                Some(idx_vec)
-                            } else {
-                                None
-                            };
-                            Some(FileMatch {
-                                score: match_.score,
-                                path: PathBuf::from(relative_path),
-                                root: inner.search_directories[root_idx].clone(),
-                                indices,
-                            })
-                        })
-                        .collect();
-
-                    let snapshot = FileSearchSnapshot {
-                        query: last_query.clone(),
-                        matches,
-                        total_match_count: snapshot.matched_item_count() as usize,
-                        scanned_file_count: snapshot.item_count() as usize,
+                if status.changed
+                    && let Some(snapshot) = snapshot::for_query(
+                        &inner,
+                        &nucleo,
+                        &last_query,
+                        &mut indices_matcher,
                         walk_complete,
-                    };
+                    )
+                {
                     inner.reporter.on_update(&snapshot);
                 }
                 if !status.running && walk_complete {
@@ -578,13 +609,14 @@ struct RunReporter {
 
 impl SessionReporter for RunReporter {
     fn on_update(&self, snapshot: &FileSearchSnapshot) {
-        #[expect(clippy::unwrap_used)]
+        #[allow(clippy::unwrap_used)]
         let mut guard = self.snapshot.write().unwrap();
         *guard = snapshot.clone();
     }
 
     fn on_complete(&self) {
         let (cv, mutex) = &self.completed;
+        #[allow(clippy::unwrap_used)]
         let mut completed = mutex.lock().unwrap();
         *completed = true;
         cv.notify_all();
@@ -594,376 +626,19 @@ impl SessionReporter for RunReporter {
 impl RunReporter {
     fn wait_for_complete(&self) -> FileSearchSnapshot {
         let (cv, mutex) = &self.completed;
+        #[allow(clippy::unwrap_used)]
         let mut completed = mutex.lock().unwrap();
         while !*completed {
-            completed = cv.wait(completed).unwrap();
+            #[allow(clippy::unwrap_used)]
+            {
+                completed = cv.wait(completed).unwrap();
+            }
         }
+        #[allow(clippy::unwrap_used)]
         self.snapshot.read().unwrap().clone()
     }
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-
-    use super::*;
-    use pretty_assertions::assert_eq;
-    use std::fs;
-    use std::sync::Arc;
-    use std::sync::Condvar;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
-    use std::thread;
-    use std::time::Duration;
-    use std::time::Instant;
-    use tempfile::TempDir;
-
-    #[test]
-    fn verify_score_is_none_for_non_match() {
-        let mut utf32buf = Vec::<char>::new();
-        let line = "hello";
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let haystack: Utf32Str<'_> = Utf32Str::new(line, &mut utf32buf);
-        let pattern = create_pattern("zzz");
-        let score = pattern.score(haystack, &mut matcher);
-        assert_eq!(score, None);
-    }
-
-    #[test]
-    fn tie_breakers_sort_by_path_when_scores_equal() {
-        let mut matches = vec![
-            (100, "b_path".to_string()),
-            (100, "a_path".to_string()),
-            (90, "zzz".to_string()),
-        ];
-
-        sort_matches(&mut matches);
-
-        // Highest score first; ties broken alphabetically.
-        let expected = vec![
-            (100, "a_path".to_string()),
-            (100, "b_path".to_string()),
-            (90, "zzz".to_string()),
-        ];
-
-        assert_eq!(matches, expected);
-    }
-
-    #[test]
-    fn file_name_from_path_uses_basename() {
-        assert_eq!(file_name_from_path("foo/bar.txt"), "bar.txt");
-    }
-
-    #[test]
-    fn file_name_from_path_falls_back_to_full_path() {
-        assert_eq!(file_name_from_path(""), "");
-    }
-
-    #[derive(Default)]
-    struct RecordingReporter {
-        updates: Mutex<Vec<FileSearchSnapshot>>,
-        complete_times: Mutex<Vec<Instant>>,
-        complete_cv: Condvar,
-        update_cv: Condvar,
-    }
-
-    impl RecordingReporter {
-        fn wait_until<T, F>(
-            &self,
-            mutex: &Mutex<T>,
-            cv: &Condvar,
-            timeout: Duration,
-            mut predicate: F,
-        ) -> bool
-        where
-            F: FnMut(&T) -> bool,
-        {
-            let deadline = Instant::now() + timeout;
-            let mut state = mutex.lock().unwrap();
-            loop {
-                if predicate(&state) {
-                    return true;
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return false;
-                }
-                let (next_state, wait_result) = cv.wait_timeout(state, remaining).unwrap();
-                state = next_state;
-                if wait_result.timed_out() {
-                    return predicate(&state);
-                }
-            }
-        }
-
-        fn wait_for_complete(&self, timeout: Duration) -> bool {
-            self.wait_until(
-                &self.complete_times,
-                &self.complete_cv,
-                timeout,
-                |completes| !completes.is_empty(),
-            )
-        }
-        fn clear(&self) {
-            self.updates.lock().unwrap().clear();
-            self.complete_times.lock().unwrap().clear();
-        }
-
-        fn updates(&self) -> Vec<FileSearchSnapshot> {
-            self.updates.lock().unwrap().clone()
-        }
-
-        fn wait_for_updates_at_least(&self, min_len: usize, timeout: Duration) -> bool {
-            self.wait_until(&self.updates, &self.update_cv, timeout, |updates| {
-                updates.len() >= min_len
-            })
-        }
-
-        fn snapshot(&self) -> FileSearchSnapshot {
-            self.updates
-                .lock()
-                .unwrap()
-                .last()
-                .cloned()
-                .unwrap_or_default()
-        }
-    }
-
-    impl SessionReporter for RecordingReporter {
-        fn on_update(&self, snapshot: &FileSearchSnapshot) {
-            let mut updates = self.updates.lock().unwrap();
-            updates.push(snapshot.clone());
-            self.update_cv.notify_all();
-        }
-
-        fn on_complete(&self) {
-            {
-                let mut complete_times = self.complete_times.lock().unwrap();
-                complete_times.push(Instant::now());
-            }
-            self.complete_cv.notify_all();
-        }
-    }
-
-    fn create_temp_tree(file_count: usize) -> TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        for i in 0..file_count {
-            let path = dir.path().join(format!("file-{i:04}.txt"));
-            fs::write(path, format!("contents {i}")).unwrap();
-        }
-        dir
-    }
-
-    #[test]
-    fn session_scanned_file_count_is_monotonic_across_queries() {
-        let dir = create_temp_tree(200);
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            None,
-        )
-        .expect("session");
-
-        session.update_query("file-00");
-        thread::sleep(Duration::from_millis(20));
-        let first_snapshot = reporter.snapshot();
-        session.update_query("file-01");
-        thread::sleep(Duration::from_millis(20));
-        let second_snapshot = reporter.snapshot();
-        let _ = reporter.wait_for_complete(Duration::from_secs(5));
-        let completed_snapshot = reporter.snapshot();
-
-        assert!(second_snapshot.scanned_file_count >= first_snapshot.scanned_file_count);
-        assert!(completed_snapshot.scanned_file_count >= second_snapshot.scanned_file_count);
-    }
-
-    #[test]
-    fn session_streams_updates_before_walk_complete() {
-        let dir = create_temp_tree(600);
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            None,
-        )
-        .expect("session");
-
-        session.update_query("file-0");
-        let completed = reporter.wait_for_complete(Duration::from_secs(5));
-
-        assert!(completed);
-        let updates = reporter.updates();
-        assert!(updates.iter().any(|snapshot| !snapshot.walk_complete));
-    }
-
-    #[test]
-    fn session_accepts_query_updates_after_walk_complete() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("alpha.txt"), "alpha").unwrap();
-        fs::write(dir.path().join("beta.txt"), "beta").unwrap();
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            None,
-        )
-        .expect("session");
-
-        session.update_query("alpha");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-        let updates_before = reporter.updates().len();
-
-        session.update_query("beta");
-        assert!(reporter.wait_for_updates_at_least(updates_before + 1, Duration::from_secs(5),));
-
-        let updates = reporter.updates();
-        let last_update = updates.last().cloned().expect("update");
-        assert!(
-            last_update
-                .matches
-                .iter()
-                .any(|file_match| file_match.path.to_string_lossy().contains("beta.txt"))
-        );
-    }
-
-    #[test]
-    fn session_emits_complete_when_query_changes_with_no_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("alpha.txt"), "alpha").unwrap();
-        fs::write(dir.path().join("beta.txt"), "beta").unwrap();
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            None,
-        )
-        .expect("session");
-
-        session.update_query("asdf");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-
-        let completed_snapshot = reporter.snapshot();
-        assert_eq!(completed_snapshot.matches, Vec::new());
-        assert_eq!(completed_snapshot.total_match_count, 0);
-
-        reporter.clear();
-
-        session.update_query("asdfa");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-        assert!(!reporter.updates().is_empty());
-    }
-
-    #[test]
-    fn dropping_session_does_not_cancel_siblings_with_shared_cancel_flag() {
-        let root_a = create_temp_tree(200);
-        let root_b = create_temp_tree(4_000);
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-
-        let reporter_a = Arc::new(RecordingReporter::default());
-        let session_a = create_session(
-            vec![root_a.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter_a,
-            Some(cancel_flag.clone()),
-        )
-        .expect("session_a");
-
-        let reporter_b = Arc::new(RecordingReporter::default());
-        let session_b = create_session(
-            vec![root_b.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter_b.clone(),
-            Some(cancel_flag),
-        )
-        .expect("session_b");
-
-        session_a.update_query("file-0");
-        session_b.update_query("file-1");
-
-        thread::sleep(Duration::from_millis(5));
-        drop(session_a);
-
-        let completed = reporter_b.wait_for_complete(Duration::from_secs(5));
-        assert_eq!(completed, true);
-    }
-
-    #[test]
-    fn session_emits_updates_when_query_changes() {
-        let dir = create_temp_tree(200);
-        let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            None,
-        )
-        .expect("session");
-
-        session.update_query("zzzzzzzz");
-        let completed = reporter.wait_for_complete(Duration::from_secs(5));
-        assert!(completed);
-
-        reporter.clear();
-
-        session.update_query("zzzzzzzzq");
-        let completed = reporter.wait_for_complete(Duration::from_secs(5));
-        assert!(completed);
-
-        let updates = reporter.updates();
-        assert_eq!(updates.len(), 1);
-    }
-
-    #[test]
-    fn run_returns_matches_for_query() {
-        let dir = create_temp_tree(40);
-        let options = FileSearchOptions {
-            limit: NonZero::new(20).unwrap(),
-            exclude: Vec::new(),
-            threads: NonZero::new(2).unwrap(),
-            compute_indices: false,
-            respect_gitignore: true,
-        };
-        let results =
-            run("file-000", vec![dir.path().to_path_buf()], options, None).expect("run ok");
-
-        assert!(!results.matches.is_empty());
-        assert!(results.total_match_count >= results.matches.len());
-        assert!(
-            results
-                .matches
-                .iter()
-                .any(|m| m.path.to_string_lossy().contains("file-0000.txt"))
-        );
-    }
-
-    #[test]
-    fn cancel_exits_run() {
-        let dir = create_temp_tree(200);
-        let cancel_flag = Arc::new(AtomicBool::new(true));
-        let search_dir = dir.path().to_path_buf();
-        let options = FileSearchOptions {
-            compute_indices: false,
-            ..Default::default()
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let result = run("file-", vec![search_dir], options, Some(cancel_flag));
-            let _ = tx.send(result);
-        });
-
-        let result = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("run should exit after cancellation");
-        handle.join().unwrap();
-
-        let results = result.expect("run ok");
-        assert_eq!(results.matches, Vec::new());
-        assert_eq!(results.total_match_count, 0);
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

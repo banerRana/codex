@@ -1,103 +1,271 @@
+//! Applies bounded agent-role overrides to an existing session config.
+//!
+//! Roles may customize the child or reduce its capabilities, but never replace the parent
+//! session's authority. A projected layer keeps existing layer-based consumers in sync.
+
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
-use crate::config::ConfigOverrides;
 use crate::config::deserialize_config_toml_with_base;
-use crate::config_loader::ConfigLayerEntry;
-use crate::config_loader::ConfigLayerStack;
-use crate::config_loader::ConfigLayerStackOrdering;
-use crate::config_loader::resolve_relative_paths_in_config_toml;
-use codex_app_server_protocol::ConfigLayerSource;
+use anyhow::anyhow;
+use codex_agent_roles::parse_agent_role_file_contents;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigLayerStack;
+use codex_config::SkillsConfig;
+use codex_config::loader::resolve_relative_paths_in_config_toml;
+use codex_exec_server::read_sensitive_file_to_string;
+use codex_features::Feature;
+use codex_features::feature_for_key;
+use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::Verbosity;
+use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::openai_models::ReasoningEffort;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::LazyLock;
 use toml::Value as TomlValue;
 
-const BUILT_IN_EXPLORER_CONFIG: &str = include_str!("builtins/explorer.toml");
-const DEFAULT_ROLE_NAME: &str = "default";
+/// The role name used when a caller omits `agent_type`.
+pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
-/// Applies a role config layer to a mutable config and preserves unspecified keys.
+#[derive(Default, Serialize)]
+struct AgentRoleOverrides {
+    developer_instructions: Option<String>,
+    model: Option<String>,
+    model_reasoning_effort: Option<ReasoningEffort>,
+    model_reasoning_summary: Option<ReasoningSummary>,
+    model_verbosity: Option<Verbosity>,
+    personality: Option<Personality>,
+    service_tier: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    features: BTreeMap<String, bool>,
+    skills: Option<SkillsConfig>,
+}
+
+/// Applies typed role overrides to the existing parent-derived configuration.
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
-    let (config_file, is_built_in) = config
-        .agent_roles
-        .get(role_name)
-        .map(|role| (&role.config_file, false))
-        .or_else(|| {
-            built_in::configs()
-                .get(role_name)
-                .map(|role| (&role.config_file, true))
-        })
+
+    let role = resolve_role_config(config, role_name)
+        .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
-    let Some(config_file) = config_file.as_ref() else {
+
+    apply_role_to_config_inner(config, role_name, &role)
+        .await
+        .map_err(|err| {
+            tracing::warn!("failed to apply role to config: {err}");
+            AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
+        })
+}
+
+async fn apply_role_to_config_inner(
+    config: &mut Config,
+    role_name: &str,
+    role: &AgentRoleConfig,
+) -> anyhow::Result<()> {
+    let is_built_in = !config.agent_roles.contains_key(role_name);
+    let Some(config_file) = role.config_file.as_ref() else {
         return Ok(());
     };
-
-    let (role_config_contents, role_config_base) = if is_built_in {
-        (
-            built_in::config_file_contents(config_file)
-                .map(str::to_owned)
-                .ok_or_else(|| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?,
-            config.codex_home.as_path(),
-        )
-    } else {
-        (
-            tokio::fs::read_to_string(config_file)
-                .await
-                .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?,
-            config_file
-                .parent()
-                .ok_or_else(|| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?,
-        )
+    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+    let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
+    let mut overrides = AgentRoleOverrides {
+        developer_instructions: role_config.developer_instructions,
+        model: role_config.model,
+        model_reasoning_effort: role_config.model_reasoning_effort,
+        model_reasoning_summary: role_config.model_reasoning_summary,
+        model_verbosity: role_config.model_verbosity,
+        personality: role_config.personality,
+        service_tier: role_config.service_tier,
+        ..Default::default()
     };
 
-    let role_config_toml: TomlValue = toml::from_str(&role_config_contents)
-        .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
-    deserialize_config_toml_with_base(role_config_toml.clone(), role_config_base)
-        .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
-    let role_layer_toml = resolve_relative_paths_in_config_toml(role_config_toml, role_config_base)
-        .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+    if let Some(features) = role_config.features {
+        for (key, enabled) in features.entries() {
+            if !enabled
+                && let Some(
+                    feature @ (Feature::ShellTool
+                    | Feature::Apps
+                    | Feature::Plugins
+                    | Feature::MemoryTool
+                    | Feature::RequestPermissionsTool),
+                ) = feature_for_key(&key)
+            {
+                overrides.features.insert(feature.key().to_string(), false);
+            }
+        }
+    }
+    if let Some(mut skills) = role_config.skills {
+        skills.config.retain(|skill| !skill.enabled);
+        skills.bundled = skills.bundled.filter(|bundled| !bundled.enabled);
+        skills.include_instructions = skills.include_instructions.filter(|enabled| !enabled);
+        skills.max_context_tokens = None;
+        if !skills.config.is_empty()
+            || skills.bundled.is_some()
+            || skills.include_instructions.is_some()
+        {
+            overrides.skills = Some(skills);
+        }
+    }
 
-    let mut layers: Vec<ConfigLayerEntry> = config
-        .config_layer_stack
-        .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
-        .into_iter()
-        .cloned()
-        .collect();
-    let layer = ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, role_layer_toml);
-    let insertion_index =
-        layers.partition_point(|existing_layer| existing_layer.name <= layer.name);
-    layers.insert(insertion_index, layer);
-
-    let config_layer_stack = ConfigLayerStack::new(
-        layers,
-        config.config_layer_stack.requirements().clone(),
-        config.config_layer_stack.requirements_toml().clone(),
-    )
-    .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
-
-    let merged_toml = config_layer_stack.effective_config();
-    let merged_config = deserialize_config_toml_with_base(merged_toml, &config.codex_home)
-        .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
-    let next_config = Config::load_config_with_layer_stack(
-        merged_config,
-        ConfigOverrides {
-            cwd: Some(config.cwd.clone()),
-            codex_linux_sandbox_exe: config.codex_linux_sandbox_exe.clone(),
-            js_repl_node_path: config.js_repl_node_path.clone(),
-            ..Default::default()
-        },
-        config.codex_home.clone(),
-        config_layer_stack,
-    )
-    .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
-    *config = next_config;
-
+    let role_layer_toml = TomlValue::try_from(&overrides)?;
+    if role_layer_toml
+        .as_table()
+        .is_some_and(toml::map::Map::is_empty)
+    {
+        return Ok(());
+    }
+    *config = role_overrides::build_next_config(config, role_layer_toml, &overrides)?;
     Ok(())
+}
+
+async fn load_role_layer_toml(
+    config: &Config,
+    config_file: &Path,
+    is_built_in: bool,
+    role_name: &str,
+) -> anyhow::Result<TomlValue> {
+    let (role_config_toml, role_config_base) = if is_built_in {
+        let role_config_contents = built_in::config_file_contents(config_file)
+            .map(str::to_owned)
+            .ok_or(anyhow!("No corresponding config content"))?;
+        let role_config_toml: TomlValue = toml::from_str(&role_config_contents)?;
+        (role_config_toml, config.codex_home.as_path())
+    } else {
+        let role_config_contents = read_sensitive_file_to_string(config_file).await?;
+        let role_config_base = config_file
+            .parent()
+            .ok_or(anyhow!("No corresponding config content"))?;
+        let role_config_toml = parse_agent_role_file_contents(
+            &role_config_contents,
+            config_file,
+            role_config_base,
+            Some(role_name),
+        )?
+        .config;
+        (role_config_toml, role_config_base)
+    };
+
+    deserialize_config_toml_with_base(role_config_toml.clone(), role_config_base)?;
+    Ok(resolve_relative_paths_in_config_toml(
+        role_config_toml,
+        role_config_base,
+    )?)
+}
+
+pub(crate) fn resolve_role_config<'a>(
+    config: &'a Config,
+    role_name: &str,
+) -> Option<&'a AgentRoleConfig> {
+    config
+        .agent_roles
+        .get(role_name)
+        .or_else(|| built_in::configs().get(role_name))
+}
+
+mod role_overrides {
+    use super::*;
+
+    pub(super) fn build_next_config(
+        config: &Config,
+        role_layer_toml: TomlValue,
+        overrides: &AgentRoleOverrides,
+    ) -> anyhow::Result<Config> {
+        let mut next_config = config.clone();
+        next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
+        if let Some(model) = &overrides.model {
+            next_config.model = Some(model.clone());
+        }
+        if let Some(instructions) = &overrides.developer_instructions {
+            next_config.developer_instructions = Some(instructions.clone());
+        }
+        if let Some(effort) = overrides.model_reasoning_effort.clone() {
+            next_config.model_reasoning_effort = Some(effort);
+        }
+        if let Some(summary) = overrides.model_reasoning_summary {
+            next_config.model_reasoning_summary = Some(summary);
+        }
+        if let Some(verbosity) = overrides.model_verbosity {
+            next_config.model_verbosity = Some(verbosity);
+        }
+        if let Some(personality) = overrides.personality {
+            next_config.personality = Some(personality);
+        }
+        if let Some(service_tier) = &overrides.service_tier {
+            next_config.service_tier = match ServiceTier::from_request_value(service_tier) {
+                Some(ServiceTier::Fast) => next_config
+                    .features
+                    .enabled(Feature::FastMode)
+                    .then(|| ServiceTier::Fast.request_value().to_string()),
+                Some(ServiceTier::Flex) => Some(ServiceTier::Flex.request_value().to_string()),
+                None if service_tier == "ultrafast" => next_config
+                    .features
+                    .enabled(Feature::UltrafastMode)
+                    .then(|| service_tier.clone()),
+                None => Some(service_tier.clone()),
+            };
+        }
+        for key in overrides.features.keys() {
+            if let Some(feature) = feature_for_key(key) {
+                next_config.features.disable(feature)?;
+            }
+        }
+        if overrides
+            .skills
+            .as_ref()
+            .is_some_and(|skills| skills.include_instructions == Some(false))
+        {
+            next_config.include_skill_instructions = false;
+        }
+        let strips_baked_personality =
+            |config: &Config| config.personality == Some(Personality::None);
+        if strips_baked_personality(config) != strips_baked_personality(&next_config)
+            && matches!(
+                config.base_instructions_provenance,
+                Some(BaseInstructionsProvenance::Model { .. })
+            )
+        {
+            next_config.base_instructions = None;
+            next_config.base_instructions_provenance = None;
+        }
+        Ok(next_config)
+    }
+
+    fn build_config_layer_stack(
+        config: &Config,
+        role_layer_toml: &TomlValue,
+    ) -> anyhow::Result<ConfigLayerStack> {
+        let mut layers: Vec<_> = config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect();
+        let role_layer =
+            ConfigLayerEntry::new(ConfigLayerSource::SessionFlags, role_layer_toml.clone());
+        let insertion_index = layers.partition_point(|layer| layer.name <= role_layer.name);
+        layers.insert(insertion_index, role_layer);
+        Ok(ConfigLayerStack::new(
+            layers,
+            config.config_layer_stack.requirements().clone(),
+            config.config_layer_stack.requirements_toml().clone(),
+        )?
+        .with_cloud_config_binding(config.config_layer_stack.cloud_config_binding().cloned())
+        .with_mcp_ema_cancellation(config.config_layer_stack.mcp_ema_cancellation().clone())
+        .with_applied_config_server(config.config_layer_stack.applied_config_server().cloned())
+        .with_user_and_project_exec_policy_rules_ignored(
+            config
+                .config_layer_stack
+                .ignore_user_and_project_exec_policy_rules(),
+        ))
+    }
 }
 
 pub(crate) mod spawn_tool_spec {
@@ -127,18 +295,46 @@ pub(crate) mod spawn_tool_spec {
             }
         }
 
-        format!(
-            r#"Optional type name for the new agent. If omitted, `{DEFAULT_ROLE_NAME}` is used.
-Available roles:
-{}
-            "#,
-            formatted_roles.join("\n"),
-        )
+        format!("Available roles:\n{}", formatted_roles.join("\n"))
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
         if let Some(description) = &declaration.description {
-            format!("{name}: {{\n{description}\n}}")
+            let locked_settings_note = declaration
+                .config_file
+                .as_ref()
+                .and_then(|config_file| {
+                    built_in::config_file_contents(config_file)
+                        .map(str::to_owned)
+                        .or_else(|| std::fs::read_to_string(config_file).ok())
+                })
+                .and_then(|contents| toml::from_str::<TomlValue>(&contents).ok())
+                .map(|role_toml| {
+                    let model = role_toml
+                        .get("model")
+                        .and_then(TomlValue::as_str);
+                    let reasoning_effort = role_toml
+                        .get("model_reasoning_effort")
+                        .and_then(TomlValue::as_str);
+                    match (model, reasoning_effort) {
+                        (Some(model), Some(reasoning_effort)) => format!(
+                            "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
+                        ),
+                        (Some(model), None) => {
+                            format!(
+                                "\n- This role's model is set to `{model}` and cannot be changed."
+                            )
+                        }
+                        (None, Some(reasoning_effort)) => {
+                            format!(
+                                "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
+                            )
+                        }
+                        (None, None) => String::new(),
+                    }
+                })
+                .unwrap_or_default();
+            format!("{name}: {{\n{description}{locked_settings_note}\n}}")
         } else {
             format!("{name}: no description")
         }
@@ -157,21 +353,21 @@ mod built_in {
                     AgentRoleConfig {
                         description: Some("Default agent.".to_string()),
                         config_file: None,
+                        nickname_candidates: None,
                     }
                 ),
                 (
                     "explorer".to_string(),
                     AgentRoleConfig {
-                        description: Some(r#"Use `explorer` for all codebase questions.
+                        description: Some(r#"Use `explorer` for specific codebase questions.
 Explorers are fast and authoritative.
-Always prefer them over manual search or file reading.
+They must be used to ask specific, well-scoped questions on the codebase.
 Rules:
-- Ask explorers first and precisely.
-- Do not re-read or re-search code they cover.
-- Trust explorer results without verification.
-- Run explorers in parallel when useful.
+- In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
+- You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.
 - Reuse existing explorers for related questions."#.to_string()),
                         config_file: Some("explorer.toml".to_string().parse().unwrap_or_default()),
+                        nickname_candidates: None,
                     }
                 ),
                 (
@@ -183,11 +379,30 @@ Typical tasks:
 - Fix tests or bugs
 - Split large refactors into independent chunks
 Rules:
-- Explicitly assign **ownership** of the task (files / responsibility).
-- Always tell workers they are **not alone in the codebase**, and they should ignore edits made by others without touching them."#.to_string()),
+- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
+- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
                         config_file: None,
+                        nickname_candidates: None,
                     }
-                )
+                ),
+                // Awaiter is temp removed
+//                 (
+//                     "awaiter".to_string(),
+//                     AgentRoleConfig {
+//                         description: Some(r#"Use an `awaiter` agent EVERY TIME you must run a command that will take some very long time.
+// This includes, but not only:
+// * testing
+// * monitoring of a long running process
+// * explicit ask to wait for something
+//
+// Rules:
+// - When an awaiter is running, you can work on something else. If you need to wait for its completion, use the largest possible timeout.
+// - Be patient with the `awaiter`.
+// - Do not use an awaiter for every compilation/test if it won't take time. Only use if for long running commands.
+// - Close the awaiter when you're done with it."#.to_string()),
+//                         config_file: Some("awaiter.toml".to_string().parse().unwrap_or_default()),
+//                     }
+//                 )
             ])
         });
         &CONFIG
@@ -195,299 +410,16 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
+        const EXPLORER: &str = include_str!("../../assets/agent/builtins/explorer.toml");
+        const AWAITER: &str = include_str!("../../assets/agent/builtins/awaiter.toml");
         match path.to_str()? {
-            "explorer.toml" => Some(BUILT_IN_EXPLORER_CONFIG),
+            "explorer.toml" => Some(EXPLORER),
+            "awaiter.toml" => Some(AWAITER),
             _ => None,
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::ConfigBuilder;
-    use crate::config_loader::ConfigLayerStackOrdering;
-    use codex_protocol::openai_models::ReasoningEffort;
-    use pretty_assertions::assert_eq;
-    use std::path::PathBuf;
-    use tempfile::TempDir;
-
-    async fn test_config_with_cli_overrides(
-        cli_overrides: Vec<(String, TomlValue)>,
-    ) -> (TempDir, Config) {
-        let home = TempDir::new().expect("create temp dir");
-        let home_path = home.path().to_path_buf();
-        let config = ConfigBuilder::default()
-            .codex_home(home_path.clone())
-            .cli_overrides(cli_overrides)
-            .fallback_cwd(Some(home_path))
-            .build()
-            .await
-            .expect("load test config");
-        (home, config)
-    }
-
-    async fn write_role_config(home: &TempDir, name: &str, contents: &str) -> PathBuf {
-        let role_path = home.path().join(name);
-        tokio::fs::write(&role_path, contents)
-            .await
-            .expect("write role config");
-        role_path
-    }
-
-    fn session_flags_layer_count(config: &Config) -> usize {
-        config
-            .config_layer_stack
-            .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
-            .into_iter()
-            .filter(|layer| layer.name == ConfigLayerSource::SessionFlags)
-            .count()
-    }
-
-    #[tokio::test]
-    async fn apply_role_defaults_to_default_and_leaves_config_unchanged() {
-        let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-        let before = config.clone();
-
-        apply_role_to_config(&mut config, None)
-            .await
-            .expect("default role should apply");
-
-        assert_eq!(before, config);
-    }
-
-    #[tokio::test]
-    async fn apply_role_returns_error_for_unknown_role() {
-        let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-
-        let err = apply_role_to_config(&mut config, Some("missing-role"))
-            .await
-            .expect_err("unknown role should fail");
-
-        assert_eq!(err, "unknown agent_type 'missing-role'");
-    }
-
-    #[tokio::test]
-    async fn apply_explorer_role_sets_model_and_adds_session_flags_layer() {
-        let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-        let before_layers = session_flags_layer_count(&config);
-
-        apply_role_to_config(&mut config, Some("explorer"))
-            .await
-            .expect("explorer role should apply");
-
-        assert_eq!(config.model.as_deref(), Some("gpt-5.1-codex-mini"));
-        assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
-        assert_eq!(session_flags_layer_count(&config), before_layers + 1);
-    }
-
-    #[tokio::test]
-    async fn apply_role_returns_unavailable_for_missing_user_role_file() {
-        let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-        config.agent_roles.insert(
-            "custom".to_string(),
-            AgentRoleConfig {
-                description: None,
-                config_file: Some(PathBuf::from("/path/does/not/exist.toml")),
-            },
-        );
-
-        let err = apply_role_to_config(&mut config, Some("custom"))
-            .await
-            .expect_err("missing role file should fail");
-
-        assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
-    }
-
-    #[tokio::test]
-    async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
-        let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
-        let role_path = write_role_config(&home, "invalid-role.toml", "model = [").await;
-        config.agent_roles.insert(
-            "custom".to_string(),
-            AgentRoleConfig {
-                description: None,
-                config_file: Some(role_path),
-            },
-        );
-
-        let err = apply_role_to_config(&mut config, Some("custom"))
-            .await
-            .expect_err("invalid role file should fail");
-
-        assert_eq!(err, AGENT_TYPE_UNAVAILABLE_ERROR);
-    }
-
-    #[tokio::test]
-    async fn apply_role_preserves_unspecified_keys() {
-        let (home, mut config) = test_config_with_cli_overrides(vec![(
-            "model".to_string(),
-            TomlValue::String("base-model".to_string()),
-        )])
-        .await;
-        let role_path = write_role_config(
-            &home,
-            "effort-only.toml",
-            "model_reasoning_effort = \"high\"",
-        )
-        .await;
-        config.agent_roles.insert(
-            "custom".to_string(),
-            AgentRoleConfig {
-                description: None,
-                config_file: Some(role_path),
-            },
-        );
-
-        apply_role_to_config(&mut config, Some("custom"))
-            .await
-            .expect("custom role should apply");
-
-        assert_eq!(config.model.as_deref(), Some("base-model"));
-        assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
-    }
-
-    #[tokio::test]
-    #[cfg(not(windows))]
-    async fn apply_role_does_not_materialize_default_sandbox_workspace_write_fields() {
-        use codex_protocol::protocol::SandboxPolicy;
-        let (home, mut config) = test_config_with_cli_overrides(vec![
-            (
-                "sandbox_mode".to_string(),
-                TomlValue::String("workspace-write".to_string()),
-            ),
-            (
-                "sandbox_workspace_write.network_access".to_string(),
-                TomlValue::Boolean(true),
-            ),
-        ])
-        .await;
-        let role_path = write_role_config(
-            &home,
-            "sandbox-role.toml",
-            r#"[sandbox_workspace_write]
-writable_roots = ["./sandbox-root"]
-"#,
-        )
-        .await;
-        config.agent_roles.insert(
-            "custom".to_string(),
-            AgentRoleConfig {
-                description: None,
-                config_file: Some(role_path),
-            },
-        );
-
-        apply_role_to_config(&mut config, Some("custom"))
-            .await
-            .expect("custom role should apply");
-
-        let role_layer = config
-            .config_layer_stack
-            .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
-            .into_iter()
-            .rfind(|layer| layer.name == ConfigLayerSource::SessionFlags)
-            .expect("expected a session flags layer");
-        let sandbox_workspace_write = role_layer
-            .config
-            .get("sandbox_workspace_write")
-            .and_then(TomlValue::as_table)
-            .expect("role layer should include sandbox_workspace_write");
-        assert_eq!(
-            sandbox_workspace_write.contains_key("network_access"),
-            false
-        );
-        assert_eq!(
-            sandbox_workspace_write.contains_key("exclude_tmpdir_env_var"),
-            false
-        );
-        assert_eq!(
-            sandbox_workspace_write.contains_key("exclude_slash_tmp"),
-            false
-        );
-
-        match &*config.permissions.sandbox_policy {
-            SandboxPolicy::WorkspaceWrite { network_access, .. } => {
-                assert_eq!(*network_access, true);
-            }
-            other => panic!("expected workspace-write sandbox policy, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() {
-        let (home, mut config) = test_config_with_cli_overrides(vec![(
-            "model".to_string(),
-            TomlValue::String("cli-model".to_string()),
-        )])
-        .await;
-        let before_layers = session_flags_layer_count(&config);
-        let role_path = write_role_config(&home, "model-role.toml", "model = \"role-model\"").await;
-        config.agent_roles.insert(
-            "custom".to_string(),
-            AgentRoleConfig {
-                description: None,
-                config_file: Some(role_path),
-            },
-        );
-
-        apply_role_to_config(&mut config, Some("custom"))
-            .await
-            .expect("custom role should apply");
-
-        assert_eq!(config.model.as_deref(), Some("role-model"));
-        assert_eq!(session_flags_layer_count(&config), before_layers + 1);
-    }
-
-    #[test]
-    fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
-        let user_defined_roles = BTreeMap::from([
-            (
-                "explorer".to_string(),
-                AgentRoleConfig {
-                    description: Some("user override".to_string()),
-                    config_file: None,
-                },
-            ),
-            ("researcher".to_string(), AgentRoleConfig::default()),
-        ]);
-
-        let spec = spawn_tool_spec::build(&user_defined_roles);
-
-        assert!(spec.contains("researcher: no description"));
-        assert!(spec.contains("explorer: {\nuser override\n}"));
-        assert!(spec.contains("default: {\nDefault agent.\n}"));
-        assert!(!spec.contains("Explorers are fast and authoritative."));
-    }
-
-    #[test]
-    fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
-        let user_defined_roles = BTreeMap::from([(
-            "aaa".to_string(),
-            AgentRoleConfig {
-                description: Some("first".to_string()),
-                config_file: None,
-            },
-        )]);
-
-        let spec = spawn_tool_spec::build(&user_defined_roles);
-        let user_index = spec.find("aaa: {\nfirst\n}").expect("find user role");
-        let built_in_index = spec
-            .find("default: {\nDefault agent.\n}")
-            .expect("find built-in role");
-
-        assert!(user_index < built_in_index);
-    }
-
-    #[test]
-    fn built_in_config_file_contents_resolves_explorer_only() {
-        assert_eq!(
-            built_in::config_file_contents(Path::new("explorer.toml")),
-            Some(BUILT_IN_EXPLORER_CONFIG)
-        );
-        assert_eq!(
-            built_in::config_file_contents(Path::new("missing.toml")),
-            None
-        );
-    }
-}
+#[path = "role_tests.rs"]
+mod tests;
